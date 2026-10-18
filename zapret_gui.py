@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-grom — обёртка над winws (zapret) для Windows. v1.3
+grom — обёртка над winws (zapret) для Windows. v1.5
 
 * Тёмный интерфейс, без консольных окон
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
-* Одна круглая кнопка запуска/остановки обхода
+* Одна круглая кнопка запуска/остановки обхода с пульсацией
+* Автозапуск обхода при открытии программы и при входе в Windows
 * Внутри встроен дистрибутив zapret — работает и без папки zapret на ПК
-* Автозапуск через планировщик задач
 * Всё в одном exe: pyinstaller --onefile --noconsole zapret_gui.py
 """
 
@@ -25,7 +25,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 APP_NAME = "grom"
-VERSION = "1.4"
+VERSION = "1.5"
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -36,9 +36,9 @@ CREATE_NO_WINDOW = 0x08000000
 # ------------------------------------------------------------------ оформление
 
 BG = "#0A0C10"
-SIDEBAR = "#0E1015"
-CARD = "#151922"
-CARD_HOVER = "#1B202B"
+SIDEBAR = "#0D0F15"
+CARD = "#161B27"
+CARD_HOVER = "#1D2432"
 CONSOLE_BG = "#090B0F"
 ACCENT = "#7C6CFF"
 ACCENT_HOVER = "#6A59F2"
@@ -47,7 +47,7 @@ RED = "#FF5D6C"
 AMBER = "#FFB454"
 TEXT = "#ECEDF3"
 MUTED = "#788094"
-BORDER = "#232937"
+BORDER = "#2A3145"
 TINT_GREEN = "#12271D"
 TINT_RED = "#2A151A"
 TINT_AMBER = "#2A2113"
@@ -55,6 +55,12 @@ TINT_AMBER = "#2A2113"
 ACTIVE_BG = "#181534"
 ACTIVE_HOVER = "#1D1940"
 ACTIVE_TEXT = "#A99DFF"
+# приглушённые оттенки для пульсации
+ACCENT_DIM = "#1A1740"
+ACCENT_BRIGHT = "#221D50"
+RED_DIM = "#3B2029"
+GREEN_DIM = "#1F9A57"
+AMBER_DIM = "#C98F3E"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -396,6 +402,8 @@ class App(ctk.CTk):
         self.proc = None
         self.strategies = []          # [{source, name, args}]
         self.selected = None
+        self.autorun_mode = autorun
+        self._pulse = False
         self.cfg = load_config()
         self.cfg.pop("services", None)
 
@@ -422,6 +430,7 @@ class App(ctk.CTk):
 
         self._reload_strategies()
         self._poll_process()
+        self._animate_pulse()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.after(150, self._apply_dark_titlebar)
@@ -430,6 +439,8 @@ class App(ctk.CTk):
             self.after(400, self._ask_elevation)
         if autorun:
             self.after(900, self._autorun_start)
+        elif self.cfg.get("autorun_bypass"):
+            self.after(1500, self._auto_bypass_start)
 
     def _apply_dark_titlebar(self):
         try:
@@ -444,6 +455,9 @@ class App(ctk.CTk):
         self.sidebar = ctk.CTkFrame(self, width=244, fg_color=SIDEBAR, corner_radius=0)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
+        # тонкая линия-разделитель справа
+        ctk.CTkFrame(self.sidebar, width=1, fg_color=BORDER).pack(
+            side="right", fill="y")
 
         # ---- логотип
         logo = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -574,9 +588,11 @@ class App(ctk.CTk):
         hero = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
                             border_color=BORDER)
         hero.pack(fill="x", pady=(20, 0))
+        ctk.CTkFrame(hero, width=104, height=5, corner_radius=3,
+                     fg_color=ACCENT).pack(pady=(12, 0))
 
         row1 = ctk.CTkFrame(hero, fg_color="transparent")
-        row1.pack(fill="x", padx=24, pady=(22, 0))
+        row1.pack(fill="x", padx=24, pady=(16, 0))
         icon = ctk.CTkFrame(row1, width=52, height=52, fg_color=ACCENT,
                             corner_radius=13)
         icon.pack(side="left")
@@ -618,7 +634,19 @@ class App(ctk.CTk):
             ctrl, text="запустить обход", font=ctk.CTkFont(size=13, weight="bold"),
             text_color=MUTED)
         self.power_caption.place(relx=0.5, y=150, anchor="n")
-        ctk.CTkFrame(hero, height=18, fg_color="transparent").pack()
+
+        # ---- автозапуск обхода при открытии
+        abrow = ctk.CTkFrame(hero, fg_color="transparent")
+        abrow.pack(fill="x", pady=(4, 0))
+        self.auto_bypass = ctk.CTkSwitch(
+            abrow, text="запускать обход при открытии программы",
+            font=ctk.CTkFont(size=12), text_color=MUTED, progress_color=ACCENT,
+            button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+            command=self._toggle_auto_bypass)
+        self.auto_bypass.pack(side="top")
+        if self.cfg.get("autorun_bypass"):
+            self.auto_bypass.select()
+        ctk.CTkFrame(hero, height=16, fg_color="transparent").pack()
 
         # ---- папка
         dirbar = ctk.CTkFrame(p, fg_color="transparent")
@@ -645,6 +673,8 @@ class App(ctk.CTk):
         log_card.pack(fill="both", expand=True, pady=(14, 0))
         head2 = ctk.CTkFrame(log_card, fg_color="transparent")
         head2.pack(fill="x", padx=16, pady=(10, 0))
+        ctk.CTkLabel(head2, text="●", text_color=GREEN,
+                     font=ctk.CTkFont(size=9)).pack(side="left", padx=(0, 7))
         ctk.CTkLabel(head2, text="ЛОГ WINWS", font=ctk.CTkFont(size=10, weight="bold"),
                      text_color=MUTED).pack(side="left")
         ctk.CTkButton(head2, text="очистить", width=82, height=24, corner_radius=7,
@@ -725,26 +755,46 @@ class App(ctk.CTk):
         p = self.pages["autostart"]
         ctk.CTkLabel(p, text="Автозапуск", font=ctk.CTkFont(size=25, weight="bold"),
                      text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(p, text="Запуск обхода вместе с входом в Windows",
+        ctk.CTkLabel(p, text="Обход вместе с входом в Windows — без лишних кликов",
                      font=ctk.CTkFont(size=13), text_color=MUTED).pack(
             anchor="w", pady=(4, 0))
 
         card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
                             border_color=BORDER)
         card.pack(fill="x", pady=(18, 0))
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.pack(fill="x", padx=22, pady=(18, 0))
+        ib = ctk.CTkFrame(top, width=44, height=44, fg_color=ACTIVE_BG,
+                          corner_radius=11)
+        ib.pack(side="left")
+        ib.pack_propagate(False)
+        ctk.CTkLabel(ib, text="↻", font=ctk.CTkFont(size=20),
+                     text_color=ACTIVE_TEXT).pack(expand=True)
+        ctk.CTkLabel(top, text="Запуск при входе в систему",
+                     font=ctk.CTkFont(size=17, weight="bold"),
+                     text_color=TEXT).pack(side="left", padx=(13, 0))
         self.auto_switch = ctk.CTkSwitch(
-            card, text="Автоматически запускать обход при входе в систему",
-            font=ctk.CTkFont(size=15), text_color=TEXT, progress_color=ACCENT,
+            top, text="", width=40, progress_color=ACCENT,
             button_color=ACCENT, button_hover_color=ACCENT_HOVER,
             command=self._toggle_autostart)
-        self.auto_switch.pack(anchor="w", padx=24, pady=(22, 6))
+        self.auto_switch.pack(side="right")
         if autostart_state():
             self.auto_switch.select()
         ctk.CTkLabel(card, text=(f"Создаётся задача планировщика Windows «{AUTOSTART_TASK}» — "
-                                 "сохранённая стратегия запускается\nпри входе в систему "
-                                 "с правами администратора, без окон."),
+                                 "сохранённая стратегия запускается при входе\n"
+                                 "в систему с правами администратора, без окон."),
                      text_color=MUTED, font=ctk.CTkFont(size=12), justify="left",
-                     wraplength=720).pack(anchor="w", padx=24, pady=(0, 22))
+                     wraplength=720).pack(anchor="w", padx=22, pady=(12, 20))
+
+        note = ctk.CTkFrame(p, fg_color=TINT_AMBER, corner_radius=14, border_width=1,
+                            border_color="#3D3418")
+        note.pack(fill="x", pady=(16, 0))
+        ctk.CTkLabel(note, text=("ⓘ  На «Главной» есть отдельный переключатель «запускать обход "
+                                 "при открытии программы» — он действует, только когда вы\n"
+                                 "сами открываете grom. Оба переключателя независимы и дополняют "
+                                 "друг друга."),
+                     text_color=AMBER, font=ctk.CTkFont(size=12), justify="left",
+                     wraplength=740).pack(anchor="w", padx=20, pady=14)
 
     def _toggle_autostart(self):
         try:
@@ -761,11 +811,18 @@ class App(ctk.CTk):
         p = self.pages["about"]
         ctk.CTkLabel(p, text="О программе", font=ctk.CTkFont(size=25, weight="bold"),
                      text_color=TEXT).pack(anchor="w")
+
+        vbadge = ctk.CTkFrame(p, fg_color=ACTIVE_BG, corner_radius=20,
+                              border_width=1, border_color="#2E2760")
+        vbadge.pack(anchor="w", pady=(12, 0))
+        ctk.CTkLabel(vbadge, text=f"⚡  {APP_NAME} v{VERSION}",
+                     text_color=ACTIVE_TEXT, font=ctk.CTkFont(
+                         size=13, weight="bold")).pack(padx=16, pady=6)
+
         card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
                             border_color=BORDER)
-        card.pack(fill="x", pady=(18, 0))
-        ctk.CTkLabel(card, text=(f"{APP_NAME} v{VERSION}\n\n"
-                                 "Графическая обёртка над winws из проекта zapret\n"
+        card.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(card, text=("Графическая обёртка над winws из проекта zapret\n"
                                  "(github.com/bol-van/zapret).\n\n"
                                  "Программа читает стратегии из .bat-файлов и запускает winws.exe\n"
                                  "скрытно, без консольных окон, показывая лог.\n\n"
@@ -775,6 +832,10 @@ class App(ctk.CTk):
                                  "драйвер WinDivert перехватывает сетевой трафик."),
                      text_color=TEXT, font=ctk.CTkFont(size=13), justify="left",
                      wraplength=740).pack(anchor="w", padx=24, pady=20)
+
+        ctk.CTkLabel(p, text="исходники: github.com/frogiiiiiiii1/grom",
+                     text_color=MUTED, font=ctk.CTkFont(size=12)).pack(
+            anchor="w", pady=(12, 0))
 
     # ---------------------------------------------------------------- логика
 
@@ -841,6 +902,23 @@ class App(ctk.CTk):
             self._stop()
         else:
             self._start()
+
+    def _toggle_auto_bypass(self):
+        on = self.auto_bypass.get() == 1
+        self.cfg["autorun_bypass"] = on
+        save_config(self.cfg)
+        self._log(f"Автозапуск обхода при открытии: {'включён' if on else 'выключен'}.")
+
+    def _auto_bypass_start(self):
+        """Автозапуск обхода при обычном (не через задачу) открытии grom."""
+        if not self.cfg.get("autorun_bypass"):
+            return
+        if self.proc and self.proc.poll() is None:
+            return
+        if not is_admin() or not self.winws_exe or not self.strategies:
+            return
+        self._log("Автозапуск обхода (включена настройка «при открытии»)…")
+        self._start()
 
     def _start(self):
         if self.proc and self.proc.poll() is None:
@@ -919,26 +997,36 @@ class App(ctk.CTk):
     def _poll_process(self):
         running = bool(self.proc and self.proc.poll() is None)
         if running:
-            self.side_status_dot.configure(text_color=GREEN)
             self.side_status_text.configure(text="обход работает", text_color=TEXT)
             self.btn_power.configure(text="■", fg_color=RED, hover_color="#E04553",
                                      font=ctk.CTkFont(size=34))
-            self.power_glow.configure(fg_color=TINT_RED)
             self.power_caption.configure(text="остановить обход", text_color="#FF9AA5")
             self.status_pill.configure(fg_color=TINT_GREEN, border_color="#1E4433")
-            self.status_dot.configure(text_color=GREEN)
             self.status_text.configure(text="работает", text_color=GREEN)
         else:
-            self.side_status_dot.configure(text_color=MUTED)
             self.side_status_text.configure(text="winws не запущен", text_color=MUTED)
             self.btn_power.configure(text="▶", fg_color=ACCENT, hover_color=ACCENT_HOVER,
                                      font=ctk.CTkFont(size=42))
-            self.power_glow.configure(fg_color="#141233")
             self.power_caption.configure(text="запустить обход", text_color=MUTED)
             self.status_pill.configure(fg_color=TINT_AMBER, border_color="#3D3418")
-            self.status_dot.configure(text_color=AMBER)
             self.status_text.configure(text="не запущен", text_color=AMBER)
         self.after(500, self._poll_process)
+
+    def _animate_pulse(self):
+        """Мягкая пульсация ореола кнопки и статусных точек."""
+        self._pulse = not self._pulse
+        running = bool(self.proc and self.proc.poll() is None)
+        if running:
+            self.power_glow.configure(fg_color=RED_DIM if self._pulse else TINT_RED)
+            self.side_status_dot.configure(
+                text_color=GREEN if self._pulse else GREEN_DIM)
+            self.status_dot.configure(text_color="#FF8A95" if self._pulse else RED)
+        else:
+            self.power_glow.configure(
+                fg_color=ACCENT_BRIGHT if self._pulse else ACCENT_DIM)
+            self.side_status_dot.configure(text_color=MUTED)
+            self.status_dot.configure(text_color=AMBER if self._pulse else AMBER_DIM)
+        self.after(750, self._animate_pulse)
 
     def _ask_elevation(self):
         if messagebox.askyesno(
