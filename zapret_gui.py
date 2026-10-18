@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.8
+grom обходник — обёртка над winws (zapret) для Windows. v1.9
 
 * Тёмный интерфейс, без консольных окон
+* Новая иконка и обновлённый дизайн (чипы меню, стеклянный логотип,
+  градиентные акценты, кольцо-гロー у круглой кнопки)
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
 * Идеально круглая кнопка запуска с плавными анимациями
 * Анимации страниц, меню и статусов
@@ -35,7 +37,7 @@ import customtkinter as ctk
 from PIL import Image, ImageOps
 
 APP_NAME = "grom обходник"
-VERSION = "1.8"
+VERSION = "1.9"
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -49,6 +51,7 @@ BG = "#0A0C10"
 SIDEBAR = "#0D0F15"
 CARD = "#161B27"
 CARD_HOVER = "#1D2432"
+BTN_HOVER = "#242A36"   # ховер подчинённых кнопок (выводится из CARD_HOVER)
 CONSOLE_BG = "#090B0F"
 ACCENT = "#7C6CFF"
 ACCENT_HOVER = "#6A59F2"
@@ -130,7 +133,7 @@ def apply_theme(preset: str, accent: str = None):
     """Ставит палитру темы в глобальные константы оформления."""
     global BG, SIDEBAR, CARD, CARD_HOVER, CONSOLE_BG, BORDER
     global ACCENT, ACCENT_HOVER, ACTIVE_BG, ACTIVE_HOVER, ACTIVE_TEXT
-    global ACCENT_DIM, ACCENT_BRIGHT
+    global ACCENT_DIM, ACCENT_BRIGHT, BTN_HOVER
     t = THEME_PRESETS.get(preset) or THEME_PRESETS["violet"]
     BG = t["bg"]
     SIDEBAR = t["sidebar"]
@@ -146,6 +149,7 @@ def apply_theme(preset: str, accent: str = None):
     ACTIVE_HOVER = lerp_color(BG, ACCENT, 0.19)
     ACCENT_DIM = lerp_color(BG, ACCENT, 0.12)
     ACCENT_BRIGHT = lerp_color(BG, ACCENT, 0.22)
+    BTN_HOVER = lerp_color(CARD_HOVER, "#FFFFFF", 0.10)
 
 
 class CircleButton(tk.Frame):
@@ -171,6 +175,10 @@ class CircleButton(tk.Frame):
         self.canvas.pack()
         self._glow = self.canvas.create_oval(
             0, 0, r_total - 1, r_total - 1, fill=ACCENT_DIM, outline="")
+        # тонкое светящееся кольцо между подсветкой и кнопкой
+        self._ring = self.canvas.create_oval(
+            ring / 2, ring / 2, r_total - ring / 2 - 1, r_total - ring / 2 - 1,
+            fill="", outline=lerp_color(ACCENT_DIM, ACCENT, 0.55), width=2)
         self._btn = self.canvas.create_oval(
             ring, ring, r_total - ring - 1, r_total - ring - 1,
             fill=ACCENT, outline="")
@@ -215,6 +223,8 @@ class CircleButton(tk.Frame):
                 glow = lerp_color(ACCENT_DIM, ACCENT_BRIGHT, s)
                 base = ACCENT_HOVER if self._hover else ACCENT
             self.canvas.itemconfig(self._glow, fill=glow)
+            self.canvas.itemconfig(self._ring, outline=lerp_color(
+                glow, lighten(base, self._press * 46), 0.55))
             self.canvas.itemconfig(self._btn, fill=lighten(base, self._press * 46))
         except tk.TclError:
             return
@@ -777,6 +787,34 @@ class App(ctk.CTk):
 
     # ---------------------------------------------------------------- сайдбар
 
+    # ---- визуальные помощники
+
+    @staticmethod
+    def _load_icon_ctk(size):
+        """Иконка grom как CTkImage нужного размера (или None)."""
+        try:
+            if os.path.isfile(ICON_PATH):
+                src = Image.open(ICON_PATH).convert("RGBA").resize(
+                    (size, size), Image.LANCZOS)
+                return ctk.CTkImage(light_image=src, dark_image=src,
+                                    size=(size, size))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _grad_bar_image(w, h, color):
+        """Неоновая линейка: яркая в центре, плавно гаснет к краям."""
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        r, g, b = hex_to_rgb(color)
+        px = img.load()
+        for x in range(w):
+            s = math.sin(math.pi * x / max(1, w - 1))
+            a = int(255 * (max(0.0, s) ** 1.3))
+            for y in range(h):
+                px[x, y] = (r, g, b, a)
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=244, fg_color=SIDEBAR, corner_radius=0)
         self.sidebar.pack(side="left", fill="y")
@@ -788,21 +826,13 @@ class App(ctk.CTk):
         # ---- логотип
         logo = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         logo.pack(fill="x", padx=22, pady=(30, 0))
-        badge = ctk.CTkFrame(logo, width=46, height=46, fg_color=ACCENT,
-                             corner_radius=14)
+        badge = ctk.CTkFrame(logo, width=46, height=46, fg_color=CARD_HOVER,
+                             corner_radius=14, border_width=1,
+                             border_color=BORDER)
         badge.pack(side="left")
         badge.pack_propagate(False)
         self.logo_badge = badge
-        self._logo_image = None
-        try:
-            if os.path.isfile(ICON_PATH):
-                from PIL import Image
-                src = Image.open(ICON_PATH).convert("RGBA").resize(
-                    (32, 32), Image.LANCZOS)
-                self._logo_image = ctk.CTkImage(light_image=src, dark_image=src,
-                                                size=(32, 32))
-        except Exception:
-            pass
+        self._logo_image = self._load_icon_ctk(34)
         if self._logo_image:
             self.logo_badge_glyph = ctk.CTkLabel(badge, image=self._logo_image, text="")
             self.logo_badge_glyph.pack(expand=True)
@@ -832,6 +862,8 @@ class App(ctk.CTk):
         # ---- пункты навигации с индикатором активного раздела
         self.nav_buttons = {}
         self.nav_indicators = {}
+        self.nav_chips = {}
+        self.nav_chip_glyphs = {}
         for key, label, icon in (("home", "Главная", "⌂"),
                                  ("autostart", "Автозапуск", "↻"),
                                  ("games", "Игры", "⌘"),
@@ -841,8 +873,15 @@ class App(ctk.CTk):
             wrap.pack(fill="x", padx=14, pady=3)
             ind = ctk.CTkFrame(wrap, width=4, height=24, corner_radius=2,
                                fg_color="transparent")
-            ind.pack(side="left", padx=(5, 11))
-            b = ctk.CTkButton(wrap, text=f"{icon}    {label}", anchor="w",
+            ind.pack(side="left", padx=(5, 9))
+            chip = ctk.CTkFrame(wrap, width=28, height=28, corner_radius=8,
+                                fg_color="transparent")
+            chip.pack(side="left", padx=(0, 9))
+            chip.pack_propagate(False)
+            glyph = ctk.CTkLabel(chip, text=icon, text_color=MUTED,
+                                 font=ctk.CTkFont(size=13))
+            glyph.pack(expand=True)
+            b = ctk.CTkButton(wrap, text=label, anchor="w",
                               height=44, corner_radius=12,
                               fg_color="transparent", hover_color=CARD_HOVER,
                               text_color=MUTED, font=ctk.CTkFont(size=13),
@@ -850,6 +889,8 @@ class App(ctk.CTk):
             b.pack(fill="x", expand=True)
             self.nav_indicators[key] = ind
             self.nav_buttons[key] = b
+            self.nav_chips[key] = chip
+            self.nav_chip_glyphs[key] = glyph
 
         # ---- карточка статуса внизу
         bottom = ctk.CTkFrame(self.sidebar, fg_color=CARD, corner_radius=14,
@@ -877,13 +918,18 @@ class App(ctk.CTk):
 
     def _materialize_sidebar(self):
         """Плавное «проявление» элементов сайдбара при старте."""
-        seq = [(0, self.logo_badge, "fg_color", ACCENT),
+        seq = [(0, self.logo_badge, "fg_color", CARD_HOVER),
                (70, self.logo_name, "text_color", TEXT),
                (140, self.logo_sub, "text_color", ACTIVE_TEXT),
                (210, self.menu_caption, "text_color", "#4A5165")]
         for i, (key, b) in enumerate(self.nav_buttons.items()):
-            target = ACTIVE_TEXT if key == self._current_page else MUTED
-            seq.append((280 + i * 70, b, "text_color", target))
+            active = key == self._current_page
+            seq.append((280 + i * 70, b, "text_color",
+                        ACTIVE_TEXT if active else MUTED))
+            seq.append((280 + i * 70, self.nav_chips[key], "fg_color",
+                        ACCENT if active else "transparent"))
+            seq.append((280 + i * 70, self.nav_chip_glyphs[key], "text_color",
+                        "#FFFFFF" if active else MUTED))
         seq.append((530, self.status_card, "fg_color", CARD))
         seq.append((560, self.side_status_text, "text_color", MUTED))
         seq.append((590, self.admin_label, "text_color",
@@ -963,16 +1009,22 @@ class App(ctk.CTk):
             self.page_hosts[k].place_forget()
             btn = self.nav_buttons[k]
             ind = self.nav_indicators[k]
+            chip = self.nav_chips[k]
+            glyph = self.nav_chip_glyphs[k]
             if k == key:
                 ind.configure(fg_color=ACCENT, height=6)
                 self._anim_indicator(ind)
                 btn.configure(fg_color=ACTIVE_BG, hover_color=ACTIVE_BG,
                               text_color=ACTIVE_TEXT,
                               font=ctk.CTkFont(size=13, weight="bold"))
+                chip.configure(fg_color=ACCENT)
+                glyph.configure(text_color="#FFFFFF")
             else:
                 ind.configure(fg_color="transparent", height=24)
                 btn.configure(fg_color="transparent", hover_color=CARD_HOVER,
                               text_color=MUTED, font=ctk.CTkFont(size=13))
+                chip.configure(fg_color="transparent")
+                glyph.configure(text_color=MUTED)
         host = self.page_hosts[key]
         host.place(relx=0, rely=0, relwidth=1, relheight=1, x=26)
         # мягкий выезд страницы справа
@@ -1026,17 +1078,21 @@ class App(ctk.CTk):
         hero = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
                             border_color=BORDER)
         hero.pack(fill="x", pady=(20, 0))
-        ctk.CTkFrame(hero, width=104, height=5, corner_radius=3,
-                     fg_color=ACCENT).pack(pady=(12, 0))
+        ctk.CTkLabel(hero, image=self._grad_bar_image(220, 5, ACCENT),
+                     text="").pack(pady=(14, 0))
 
         row1 = ctk.CTkFrame(hero, fg_color="transparent")
         row1.pack(fill="x", padx=24, pady=(16, 0))
-        icon = ctk.CTkFrame(row1, width=52, height=52, fg_color=ACCENT,
-                            corner_radius=13)
+        icon = ctk.CTkFrame(row1, width=52, height=52, fg_color="transparent")
         icon.pack(side="left")
         icon.pack_propagate(False)
-        ctk.CTkLabel(icon, text="⚡", font=ctk.CTkFont(size=22),
-                     text_color="#FFFFFF").pack(expand=True)
+        hero_icon = self._load_icon_ctk(52)
+        if hero_icon:
+            ctk.CTkLabel(icon, image=hero_icon, text="").pack(expand=True)
+        else:
+            icon.configure(fg_color=ACCENT, corner_radius=13)
+            ctk.CTkLabel(icon, text="⚡", font=ctk.CTkFont(size=22),
+                         text_color="#FFFFFF").pack(expand=True)
         meta = ctk.CTkFrame(row1, fg_color="transparent")
         meta.pack(side="left", padx=(14, 0))
         ctk.CTkLabel(meta, text="СТРАТЕГИЯ ОБХОДА", font=ctk.CTkFont(
@@ -1050,7 +1106,7 @@ class App(ctk.CTk):
         self.hero_source.pack(anchor="w")
         self.btn_settings = ctk.CTkButton(
             row1, text="⚙", width=44, height=44, corner_radius=11,
-            fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+            fg_color=CARD_HOVER, hover_color=BTN_HOVER, border_width=1,
             border_color=BORDER, text_color=TEXT, font=ctk.CTkFont(size=17),
             command=self._open_strategy_editor)
         self.btn_settings.pack(side="right")
@@ -1091,7 +1147,7 @@ class App(ctk.CTk):
         if self.zapret_dir:
             self.dir_entry.insert(0, self.zapret_dir)
         ctk.CTkButton(dirbar, text="Обзор…", width=92, height=34, corner_radius=9,
-                      fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+                      fg_color=CARD_HOVER, hover_color=BTN_HOVER, border_width=1,
                       border_color=BORDER, text_color=TEXT,
                       command=self._choose_dir).pack(side="left")
         ctk.CTkButton(dirbar, text="Применить", width=104, height=34, corner_radius=9,
@@ -1104,8 +1160,10 @@ class App(ctk.CTk):
         log_card.pack(fill="both", expand=True, pady=(14, 0))
         head2 = ctk.CTkFrame(log_card, fg_color="transparent")
         head2.pack(fill="x", padx=16, pady=(10, 0))
-        ctk.CTkLabel(head2, text="●", text_color=GREEN,
-                     font=ctk.CTkFont(size=9)).pack(side="left", padx=(0, 7))
+        for dot_color in (RED, AMBER, GREEN):
+            ctk.CTkLabel(head2, text="●", text_color=dot_color,
+                         font=ctk.CTkFont(size=9)).pack(side="left",
+                                                        padx=(0, 6))
         ctk.CTkLabel(head2, text="ЛОГ WINWS", font=ctk.CTkFont(size=10, weight="bold"),
                      text_color=MUTED).pack(side="left")
         ctk.CTkButton(head2, text="очистить", width=82, height=24, corner_radius=7,
@@ -1173,7 +1231,7 @@ class App(ctk.CTk):
                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
                       command=apply_edit).pack(side="right")
         ctk.CTkButton(rowb, text="Отмена", height=38, corner_radius=10,
-                      fg_color=CARD_HOVER, hover_color="#242A36",
+                      fg_color=CARD_HOVER, hover_color=BTN_HOVER,
                       border_width=1, border_color=BORDER, text_color=MUTED,
                       command=win.destroy).pack(side="right", padx=(0, 8))
 
@@ -1595,7 +1653,7 @@ class App(ctk.CTk):
                                command=lambda col=c: self._set_accent(col))
             sw.pack(side="left", padx=(0, 10))
         ctk.CTkButton(sw_row, text="свой…", width=74, height=38, corner_radius=19,
-                      fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+                      fg_color=CARD_HOVER, hover_color=BTN_HOVER, border_width=1,
                       border_color=BORDER, text_color=TEXT,
                       font=ctk.CTkFont(size=12),
                       command=self._pick_custom_accent).pack(side="left")
@@ -1615,7 +1673,7 @@ class App(ctk.CTk):
         bg_row = ctk.CTkFrame(card3, fg_color="transparent")
         bg_row.pack(fill="x", padx=22, pady=(0, 4))
         ctk.CTkButton(bg_row, text="выбрать картинку…", height=34, corner_radius=9,
-                      fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+                      fg_color=CARD_HOVER, hover_color=BTN_HOVER, border_width=1,
                       border_color=BORDER, text_color=TEXT,
                       font=ctk.CTkFont(size=12),
                       command=self._pick_bg_image).pack(side="left")
@@ -1867,7 +1925,8 @@ class App(ctk.CTk):
                      text_color=TEXT).pack(anchor="w")
 
         vbadge = ctk.CTkFrame(p, fg_color=ACTIVE_BG, corner_radius=20,
-                              border_width=1, border_color="#2E2760")
+                              border_width=1,
+                              border_color=lerp_color(ACTIVE_BG, ACCENT, 0.25))
         vbadge.pack(anchor="w", pady=(12, 0))
         ctk.CTkLabel(vbadge, text=f"⚡  {APP_NAME} v{VERSION}",
                      text_color=ACTIVE_TEXT, font=ctk.CTkFont(
