@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.10
+grom обходник — обёртка над winws (zapret) для Windows. v1.11
 
 * Тёмный интерфейс, без консольных окон
-* Новая VPN-страница (как в happ): подписка, список серверов, обновление,
-  проверка пинга, подключение через встроенный sing-box + системный прокси
+* VPN-страница (как в happ): подписка, серверы с флагами стран, обновление
+  (вручную и автоматически каждый час), проверка пинга, подключение через
+  встроенный sing-box + системный прокси; оповещение, если сервер сдохнет
+* Копирование/вставка правой кнопкой мыши в полях и логе
 * Обновлённая иконка и дизайн (чипы меню, стеклянный логотип,
   градиентные акценты, кольцо-гロー у круглой кнопки)
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
@@ -37,7 +39,9 @@ from PIL import Image, ImageOps
 import vpn_core
 
 APP_NAME = "grom обходник"
-VERSION = "1.10"
+VERSION = "1.11"
+VPN_CHECK_INTERVAL = 20     # сек между проверками живости VPN-сервера
+VPN_DEAD_FAILS = 3          # столько молчаний подряд = сервер сдох
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -697,6 +701,17 @@ class App(ctk.CTk):
                 self.iconbitmap(ICON_PATH)
         except Exception:
             pass
+        # второй источник иконки окна (taskbar/alt-tab): PNG 256px
+        try:
+            png = os.path.join(
+                getattr(sys, "_MEIPASS",
+                        os.path.dirname(os.path.abspath(__file__))),
+                "grom_icon.png")
+            if os.path.isfile(png):
+                self._win_icon_img = tk.PhotoImage(file=png)
+                self.iconphoto(True, self._win_icon_img)
+        except Exception:
+            pass
 
         self.zapret_dir = detect_zapret_dir(self.cfg.get("zapret_dir"))
         if not self.zapret_dir:
@@ -723,6 +738,8 @@ class App(ctk.CTk):
         self._vpn_proxy_state = None
         self._vpn_busy = False
         self._vpn_updated = None      # время последнего обновления
+        self._vpn_last_ts = float(vcfg.get("last_update") or 0)
+        self._vpn_mon_stop = False    # флаг остановки монитора сервера
 
         self._build_sidebar()
         self._build_pages()
@@ -732,6 +749,7 @@ class App(ctk.CTk):
         self._poll_process()
         self._animate_pulse()
         threading.Thread(target=self._hw_loop, daemon=True).start()
+        self.after(6000, self._vpn_tick)
         self.after(1200, self._hw_update)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -780,6 +798,91 @@ class App(ctk.CTk):
             for y in range(h):
                 px[x, y] = (r, g, b, a)
         return ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+
+    @staticmethod
+    def _attach_context(widget, kind="entry", log_mode=False):
+        """Правая кнопка мыши: вырезать/копировать/вставить/выделить всё.
+
+        kind="entry" — для полей ввода, kind="text" — для текстовых блоков.
+        log_mode=True — блок только для чтения: копирование без вставки.
+        """
+        try:
+            inner = widget._entry if kind == "entry" else widget._textbox
+        except AttributeError:
+            inner = widget
+        menu = tk.Menu(inner, tearoff=0, bg=CARD, fg=TEXT,
+                       activebackground=ACCENT, activeforeground="#FFFFFF",
+                       borderwidth=0, font=ctk.CTkFont(size=12))
+
+        def _copy_sel():
+            try:
+                if kind == "entry":
+                    inner.selection_get()
+                else:
+                    inner.get("sel.first", "sel.last")
+                inner.event_generate("<<Copy>>")
+            except tk.TclError:
+                pass
+
+        def _copy_all():
+            try:
+                txt = (inner.get() if kind == "entry"
+                       else inner.get("1.0", "end-1c"))
+                inner.clipboard_clear()
+                inner.clipboard_append(txt)
+            except tk.TclError:
+                pass
+
+        def _paste():
+            try:
+                inner.event_generate("<<Paste>>")
+            except tk.TclError:
+                pass
+
+        def _cut():
+            try:
+                inner.event_generate("<<Cut>>")
+            except tk.TclError:
+                pass
+
+        def _select_all():
+            try:
+                if kind == "entry":
+                    inner.focus_force()
+                    inner.select_range(0, "end")
+                    inner.icursor("end")
+                else:
+                    inner.tag_add("sel", "1.0", "end-1c")
+            except tk.TclError:
+                pass
+
+        menu.add_command(label="Копировать", command=_copy_sel)
+        if log_mode:
+            menu.add_command(label="Копировать весь текст", command=_copy_all)
+        else:
+            menu.add_command(label="Вырезать", command=_cut)
+            menu.add_command(label="Вставить", command=_paste)
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=_select_all)
+
+        def _popup(e):
+            try:
+                if kind == "entry":
+                    inner.icursor(f"@{e.x}")
+                else:
+                    inner.mark_set("insert", f"@{e.x},{e.y}")
+                menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                try:
+                    menu.grab_release()
+                except tk.TclError:
+                    pass
+
+        for seq in ("<Button-3>", "<Shift-F10>", "<Control-Mouse-2>"):
+            try:
+                inner.bind(seq, _popup)
+            except tk.TclError:
+                pass
 
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=244, fg_color=SIDEBAR, corner_radius=0)
@@ -1112,6 +1215,7 @@ class App(ctk.CTk):
                                       border_color=BORDER, fg_color=CARD,
                                       text_color=TEXT)
         self.dir_entry.pack(side="left", fill="x", expand=True, padx=10)
+        self._attach_context(self.dir_entry)
         if self.zapret_dir:
             self.dir_entry.insert(0, self.zapret_dir)
         ctk.CTkButton(dirbar, text="Обзор…", width=92, height=34, corner_radius=9,
@@ -1144,6 +1248,7 @@ class App(ctk.CTk):
                                       corner_radius=10, border_width=0)
         self.log_box.pack(fill="both", expand=True, padx=12, pady=(8, 12))
         self.log_box.configure(state="disabled")
+        self._attach_context(self.log_box, kind="text", log_mode=True)
         if not self._log_lines:
             self._log(f"{APP_NAME} v{VERSION}. Нажмите круглую кнопку, чтобы запустить обход.")
 
@@ -1183,6 +1288,7 @@ class App(ctk.CTk):
                              font=ctk.CTkFont(family="Consolas", size=11),
                              corner_radius=10)
         box.pack(fill="both", expand=True, padx=22)
+        self._attach_context(box, kind="text")
         if self.selected is not None and self.strategies:
             box.insert("1.0", self.strategies[self.selected]["args"])
 
@@ -1367,6 +1473,7 @@ class App(ctk.CTk):
         self.vpn_sub_entry.pack(side="left", fill="x", expand=True)
         if self._vpn_sub_url:
             self.vpn_sub_entry.insert(0, self._vpn_sub_url)
+        self._attach_context(self.vpn_sub_entry)
         self.vpn_fetch_btn = ctk.CTkButton(
             row, text="обновить серверы", width=150, height=36, corner_radius=9,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
@@ -1426,7 +1533,7 @@ class App(ctk.CTk):
                 t = self._vpn_updated.strftime("%H:%M")
                 self.vpn_sub_hint.configure(
                     text=f"последнее обновление: {t} · серверов: "
-                         f"{len(self._vpn_servers)}")
+                         f"{len(self._vpn_servers)} · автообновление каждый час")
             elif self._vpn_sub_url:
                 self.vpn_sub_hint.configure(
                     text="ссылка сохранена — нажмите «обновить серверы», "
@@ -1440,23 +1547,35 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-    def _vpn_fetch(self):
+    def _vpn_tick(self):
+        """Каждый час тихо обновляем подписку, если ссылка есть."""
+        try:
+            if (self._vpn_sub_url and not self._vpn_busy
+                    and time.time() - self._vpn_last_ts >= 3600):
+                self._vpn_fetch(silent=True)
+        except Exception:
+            pass
+        self.after(60000, self._vpn_tick)
+
+    def _vpn_fetch(self, silent=False):
         if self._vpn_busy:
             return
         url = self.vpn_sub_entry.get().strip()
         if not url or "://" not in url:
-            messagebox.showwarning(APP_NAME, "Вставьте ссылку подписки — "
-                                             "она начинается с http:// или "
-                                             "другой схемой.")
+            if not silent:
+                messagebox.showwarning(APP_NAME, "Вставьте ссылку подписки — "
+                                                 "она начинается с http:// или "
+                                                 "другой схемой.")
             return
         self._vpn_busy = True
         self.vpn_fetch_btn.configure(state="disabled", text="загрузка…")
-        self._log("VPN: скачиваю подписку…")
+        if not silent:
+            self._log("VPN: скачиваю подписку…")
         ua = str((self.cfg.get("vpn") or {}).get("ua") or "") or None
         threading.Thread(target=self._vpn_fetch_worker,
-                         args=(url, ua), daemon=True).start()
+                         args=(url, ua, silent), daemon=True).start()
 
-    def _vpn_fetch_worker(self, url, ua):
+    def _vpn_fetch_worker(self, url, ua, silent=False):
         err = None
         servers = []
         try:
@@ -1471,26 +1590,33 @@ class App(ctk.CTk):
         except Exception as e:
             err = str(e) or type(e).__name__
         try:
-            self.after(0, self._vpn_fetch_done, url, servers, err)
+            self.after(0, self._vpn_fetch_done, url, servers, err, silent)
         except Exception:
             pass
 
-    def _vpn_fetch_done(self, url, servers, err):
+    def _vpn_fetch_done(self, url, servers, err, silent=False):
         self._vpn_busy = False
         try:
             self.vpn_fetch_btn.configure(state="normal", text="обновить серверы")
         except tk.TclError:
             return
         if err:
-            self._log(f"VPN: не получилось — {err}")
-            messagebox.showerror(APP_NAME, f"Не удалось получить серверы:\n{err}")
+            if silent:
+                self._log(f"VPN: автообновление не удалось — {err}. "
+                          f"Попробую через час.")
+            else:
+                self._log(f"VPN: не получилось — {err}")
+                messagebox.showerror(APP_NAME,
+                                     f"Не удалось получить серверы:\n{err}")
             return
         self._vpn_sub_url = url
         self._vpn_servers = servers
         self._vpn_pings = {}
         self._vpn_updated = time.localtime()
+        self._vpn_last_ts = time.time()
         self.cfg["vpn"] = dict(self.cfg.get("vpn") or {},
-                               sub_url=url, selected_link=self._vpn_sel_link)
+                               sub_url=url, selected_link=self._vpn_sel_link,
+                               last_update=self._vpn_last_ts)
         save_config(self.cfg)
         # сохранённый выбор мог исчезнуть из подписки
         if self._vpn_sel_link not in {s["link"] for s in servers}:
@@ -1521,6 +1647,12 @@ class App(ctk.CTk):
             dot = ctk.CTkLabel(fr, text="●", font=ctk.CTkFont(size=9),
                                text_color=ACCENT if sel else MUTED)
             dot.pack(side="left", padx=(14, 8))
+            flag_lbl = None
+            flag = rec.get("flag") or ""
+            if flag:
+                flag_lbl = ctk.CTkLabel(fr, text=flag, width=26,
+                                        font=ctk.CTkFont(size=15))
+                flag_lbl.pack(side="left")
             name = rec["name"][:60]
             ctk.CTkLabel(fr, text=name, font=ctk.CTkFont(
                 size=13, weight="bold" if sel else "normal"),
@@ -1532,8 +1664,9 @@ class App(ctk.CTk):
                                 font=ctk.CTkFont(size=12),
                                 text_color=MUTED)
             ping.pack(side="right", padx=(0, 14))
-            for w in (fr, dot, ping):
-                w.bind("<Button-1>", lambda e, k=i: self._vpn_select(k))
+            for w in (fr, dot, ping, flag_lbl):
+                if w is not None:
+                    w.bind("<Button-1>", lambda e, k=i: self._vpn_select(k))
             self._vpn_rows.append((fr, dot, ping, rec))
             if rec["link"] in self._vpn_pings:
                 self._vpn_paint_ping(ping, self._vpn_pings[rec["link"]])
@@ -1693,9 +1826,45 @@ class App(ctk.CTk):
                       f"127.0.0.1:{port}")
         self._vpn_proc = proc
         self._vpn_port = port
+        self._vpn_mon_stop = False
+        threading.Thread(target=self._vpn_monitor,
+                         args=(proc, rec), daemon=True).start()
         self._vpn_apply_connected_ui()
         self._log(f"VPN: подключено к «{rec['name'][:40]}» "
                   f"({rec['host']}:{rec['port']}), прокси 127.0.0.1:{port}.")
+
+    def _vpn_monitor(self, proc, rec):
+        """Следит за сервером: сдох или отвалился — просим оповестить."""
+        fails = 0
+        res = None
+        while not self._vpn_mon_stop and self._vpn_proc is proc:
+            time.sleep(VPN_CHECK_INTERVAL)
+            if self._vpn_mon_stop or self._vpn_proc is not proc:
+                return
+            if proc.poll() is not None:
+                res = "core"
+                break
+            ms = vpn_core.tcp_ping(rec["host"], rec["port"], timeout=5.0)
+            fails = 0 if ms is not None else fails + 1
+            if fails >= VPN_DEAD_FAILS:   # сервер молчит — отключаем
+                res = "dead"
+                break
+        try:
+            self.after(0, self._vpn_monitor_done, res, rec)
+        except Exception:
+            pass
+
+    def _vpn_monitor_done(self, res, rec):
+        if not res or not self._vpn_proc:
+            return
+        name = rec["name"][:40]
+        self._vpn_disconnect(silent=True)
+        self._log(f"VPN: сервер «{name}» перестал отвечать — отключено.")
+        messagebox.showwarning(
+            APP_NAME,
+            f"VPN-сервер «{name}» перестал отвечать.\n"
+            f"Соединение разорвано — ПК снова выходит в интернет напрямую.\n"
+            f"Выберите другой сервер и подключитесь заново.")
 
     def _vpn_apply_connected_ui(self):
         try:
@@ -1710,6 +1879,7 @@ class App(ctk.CTk):
             pass
 
     def _vpn_disconnect(self, silent=False):
+        self._vpn_mon_stop = True
         proc, self._vpn_proc = self._vpn_proc, None
         if proc:
             try:

@@ -13,6 +13,7 @@ VPN-клиентов, включая happ). Модуль умеет:
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -25,6 +26,124 @@ CREATE_NO_WINDOW = 0x08000000
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) "
               "Gecko/20100101 Firefox/128.0 grom")
 SCHEMES = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2", "tuic")
+
+# ----------------------------------------------------- флаги стран по имени
+# Код: двухбуквенный ключ (в т.ч. как ЗАГЛАВНЫЕ коды в именах серверов),
+# Слово: названия стран и городов, встречаются в именах подписок.
+FLAGS = {
+    "us": "🇺🇸", "usa": "🇺🇸", "america": "🇺🇸", "united states": "🇺🇸",
+    "new york": "🇺🇸", "los angeles": "🇺🇸", "seattle": "🇺🇸",
+    "de": "🇩🇪", "germany": "🇩🇪", "frankfurt": "🇩🇪", "berlin": "🇩🇪",
+    "nl": "🇳🇱", "netherlands": "🇳🇱", "amsterdam": "🇳🇱",
+    "fi": "🇫🇮", "finland": "🇫🇮", "helsinki": "🇫🇮",
+    "se": "🇸🇪", "sweden": "🇸🇪", "stockholm": "🇸🇪",
+    "no": "🇳🇴", "norway": "🇳🇴", "oslo": "🇳🇴",
+    "dk": "🇩🇰", "denmark": "🇩🇰", "copenhagen": "🇩🇰",
+    "is": "🇮🇸", "iceland": "🇮🇸", "reykjavik": "🇮🇸",
+    "tr": "🇹🇷", "turkey": "🇹🇷", "turkiye": "🇹🇷", "istanbul": "🇹🇷",
+    "ru": "🇷🇺", "russia": "🇷🇺", "moscow": "🇷🇺", "москва": "🇷🇺",
+    "fr": "🇫🇷", "france": "🇫🇷", "paris": "🇫🇷",
+    "gb": "🇬🇧", "uk": "🇬🇧", "united kingdom": "🇬🇧", "england": "🇬🇧",
+    "london": "🇬🇧",
+    "jp": "🇯🇵", "japan": "🇯🇵", "tokyo": "🇯🇵", "осака": "🇯🇵",
+    "sg": "🇸🇬", "singapore": "🇸🇬",
+    "hk": "🇭🇰", "hong kong": "🇭🇰",
+    "kr": "🇰🇷", "korea": "🇰🇷", "seoul": "🇰🇷",
+    "tw": "🇹🇼", "taiwan": "🇹🇼",
+    "ca": "🇨🇦", "canada": "🇨🇦", "toronto": "🇨🇦",
+    "mx": "🇲🇽", "mexico": "🇲🇽",
+    "br": "🇧🇷", "brazil": "🇧🇷",
+    "ar": "🇦🇷", "argentina": "🇦🇷",
+    "cl": "🇨🇱", "chile": "🇨🇱",
+    "co": "🇨🇴", "colombia": "🇨🇴",
+    "pe": "🇵🇪", "peru": "🇵🇪",
+    "pl": "🇵🇱", "poland": "🇵🇱", "warsaw": "🇵🇱", "варшава": "🇵🇱",
+    "at": "🇦🇹", "austria": "🇦🇹", "vienna": "🇦🇹",
+    "ch": "🇨🇭", "switzerland": "🇨🇭", "zurich": "🇨🇭",
+    "es": "🇪🇸", "spain": "🇪🇸", "madrid": "🇪🇸",
+    "it": "🇮🇹", "italy": "🇮🇹", "milan": "🇮🇹", "rome": "🇮🇹",
+    "be": "🇧🇪", "belgium": "🇧🇪", "brussels": "🇧🇪",
+    "pt": "🇵🇹", "portugal": "🇵🇹", "lisbon": "🇵🇹",
+    "ie": "🇮🇪", "ireland": "🇮🇪", "dublin": "🇮🇪",
+    "cz": "🇨🇿", "czech": "🇨🇿", "czechia": "🇨🇿", "prague": "🇨🇿",
+    "sk": "🇸🇰", "slovakia": "🇸🇰", "bratislava": "🇸🇰",
+    "hu": "🇭🇺", "hungary": "🇭🇺", "budapest": "🇭🇺",
+    "ro": "🇷🇴", "romania": "🇷🇴", "bucharest": "🇷🇴",
+    "bg": "🇧🇬", "bulgaria": "🇧🇬", "sofia": "🇧🇬",
+    "rs": "🇷🇸", "serbia": "🇷🇸", "belgrade": "🇷🇸",
+    "hr": "🇭🇷", "croatia": "🇭🇷", "zagreb": "🇭🇷",
+    "si": "🇸🇮", "slovenia": "🇸🇮", "ljubljana": "🇸🇮",
+    "gr": "🇬🇷", "greece": "🇬🇷", "athens": "🇬🇷",
+    "ua": "🇺🇦", "ukraine": "🇺🇦", "kyiv": "🇺🇦", "киев": "🇺🇦",
+    "by": "🇧🇾", "belarus": "🇧🇾", "минск": "🇧🇾",
+    "md": "🇲🇩", "moldova": "🇲🇩",
+    "ee": "🇪🇪", "estonia": "🇪🇪", "tallinn": "🇪🇪",
+    "lv": "🇱🇻", "latvia": "🇱🇻", "riga": "🇱🇻",
+    "lt": "🇱🇹", "lithuania": "🇱🇹", "vilnius": "🇱🇹",
+    "lu": "🇱🇺", "luxembourg": "🇱🇺",
+    "kz": "🇰🇿", "kazakhstan": "🇰🇿", "алматы": "🇰🇿", "астана": "🇰🇿",
+    "uz": "🇺🇿", "uzbekistan": "🇺🇿", "ташкент": "🇺🇿",
+    "kg": "🇰🇬", "kyrgyzstan": "🇰🇬", "бишкек": "🇰🇬",
+    "tj": "🇹🇯", "tajikistan": "🇹🇯",
+    "ge": "🇬🇪", "georgia": "🇬🇪", "tbilisi": "🇬🇪", "тбилиси": "🇬🇪",
+    "am": "🇦🇲", "armenia": "🇦🇲", "yerevan": "🇦🇲", "ереван": "🇦🇲",
+    "az": "🇦🇿", "azerbaijan": "🇦🇿", "baku": "🇦🇿",
+    "mn": "🇲🇳", "mongolia": "🇲🇳",
+    "ae": "🇦🇪", "uae": "🇦🇪", "dubai": "🇦🇪", "emirates": "🇦🇪",
+    "sa": "🇸🇦", "saudi": "🇸🇦", "riyadh": "🇸🇦",
+    "qa": "🇶🇦", "qatar": "🇶🇦", "doha": "🇶🇦",
+    "il": "🇮🇱", "israel": "🇮🇱", "tel aviv": "🇮🇱",
+    "in": "🇮🇳", "india": "🇮🇳", "mumbai": "🇮🇳", "delhi": "🇮🇳",
+    "pk": "🇵🇰", "pakistan": "🇵🇰",
+    "bd": "🇧🇩", "bangladesh": "🇧🇩",
+    "id": "🇮🇩", "indonesia": "🇮🇩", "jakarta": "🇮🇩",
+    "my": "🇲🇾", "malaysia": "🇲🇾", "kuala lumpur": "🇲🇾",
+    "th": "🇹🇭", "thailand": "🇹🇭", "bangkok": "🇹🇭",
+    "vn": "🇻🇳", "vietnam": "🇻🇳", "hanoi": "🇻🇳", "ho chi minh": "🇻🇳",
+    "ph": "🇵🇭", "philippines": "🇵🇭", "manila": "🇵🇭",
+    "au": "🇦🇺", "australia": "🇦🇺", "sydney": "🇦🇺", "melbourne": "🇦🇺",
+    "nz": "🇳🇿", "new zealand": "🇳🇿", "auckland": "🇳🇿",
+    "za": "🇿🇦", "south africa": "🇿🇦", "johannesburg": "🇿🇦",
+    "ng": "🇳🇬", "nigeria": "🇳🇬", "lagos": "🇳🇬",
+    "eg": "🇪🇬", "egypt": "🇪🇬", "cairo": "🇪🇬",
+    "ke": "🇰🇪", "kenya": "🇰🇪", "nairobi": "🇰🇪",
+}
+# ключи-коды (2 буквы) и ключи-слова (для разбиения по способу поиска)
+_CODE_KEYS = {k for k in FLAGS if len(k) == 2 and k.isascii()}
+_WORD_KEYS = sorted((k for k in FLAGS if len(k) > 2),
+                    key=len, reverse=True)
+# английские предлоги/союзы длиной 2 — не принимаем за код страны
+_STOP2 = {"in", "on", "of", "at", "to", "by", "no", "is", "it", "be",
+          "my", "me", "or", "as", "so", "up", "do", "if", "we", "he"}
+
+
+def guess_flag(name):
+    """Эмодзи-флаг по имени сервера (или пустая строка)."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    low = name.lower()
+    norm = re.sub(r"[^0-9a-zа-яё]+", " ", low).strip()
+    # 1) многосимвольные: "hong kong", "germany", "tokyo"...
+    for key in _WORD_KEYS:
+        if len(key) > 3:
+            if key in norm:
+                return FLAGS[key]
+    # 2) короткие названия ("no", "uk", "tr"...) — только как целое слово
+    words = set(norm.split())
+    for key in _CODE_KEYS:
+        if len(key) > 2 and key in words:
+            return FLAGS[key]
+    # 3) ДВУХБУКВЕННЫЕ КОДЫ: надёжнее всего ЗАГЛАВНЫЕ ("US-01", "DE Premium")
+    for tok in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", name):
+        if len(tok) == 2 and tok.isascii() and tok.isupper() \
+                and tok.lower() in _CODE_KEYS:
+            return FLAGS[tok.lower()]
+    # 4) строчные коды, кроме английских слов
+    for w in words:
+        if len(w) == 2 and w not in _STOP2 and w in _CODE_KEYS:
+            return FLAGS[w]
+    return ""
 
 
 def local_data_dir():
@@ -316,11 +435,15 @@ def _parse_ss(link, name, host, port, u):
 
 
 def parse_links(links):
-    """Пакетный разбор; в список записей (нераспознанные пропускаются)."""
+    """Пакетный разбор; в список записей (нераспознанные пропускаются).
+
+    К каждой записи добавляется «flag» — эмодзи-флаг по имени сервера.
+    """
     out = []
     for l in links:
         rec = parse_link(l)
         if rec:
+            rec["flag"] = guess_flag(rec["name"])
             out.append(rec)
     return out
 
