@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.7
+grom обходник — обёртка над winws (zapret) для Windows. v1.8
 
 * Тёмный интерфейс, без консольных окон
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
 * Идеально круглая кнопка запуска с плавными анимациями
 * Анимации страниц, меню и статусов
 * Вкладка «Тема»: цветовые темы, свой акцент, фон-картинка, скругление
+* Вкладка «Игры»: живой FPS/фреймтайм (PresentMon) + загрузка CPU/GPU/ОЗУ
 * Автозапуск обхода при открытии программы и при входе в Windows
 * Внутри встроен дистрибутив zapret — работает и без папки zapret на ПК
 * Всё в одном exe: pyinstaller --onefile --noconsole zapret_gui.py
 """
 
 import ctypes
+import csv
+import io
+from collections import deque
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -23,13 +28,14 @@ import sys
 import threading
 import time
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import colorchooser, filedialog, messagebox
 
 import customtkinter as ctk
 from PIL import Image, ImageOps
 
 APP_NAME = "grom обходник"
-VERSION = "1.7"
+VERSION = "1.8"
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -545,6 +551,152 @@ def ensure_embedded_zapret():
         pass
     return find_winws(EMBEDDED_DIR) and EMBEDDED_DIR
 
+# ------------------------------------------------- встроенный PresentMon (FPS)
+
+
+PRESENTMON_BUNDLE = os.path.join(getattr(sys, "_MEIPASS",
+                                          os.path.dirname(os.path.abspath(__file__))),
+                                 "tools", "PresentMon.exe")
+PRESENTMON_PATH = os.path.join(_local_data_dir(), "tools", "PresentMon.exe")
+
+
+def ensure_presentmon():
+    """Распаковать встроенный PresentMon в %LOCALAPPDATA%\\grom\\tools.
+
+    Возвращает путь к exe или None.
+    """
+    try:
+        if os.path.isfile(PRESENTMON_BUNDLE):
+            os.makedirs(os.path.dirname(PRESENTMON_PATH), exist_ok=True)
+            if (not os.path.isfile(PRESENTMON_PATH)
+                    or os.path.getsize(PRESENTMON_PATH)
+                    != os.path.getsize(PRESENTMON_BUNDLE)):
+                shutil.copy2(PRESENTMON_BUNDLE, PRESENTMON_PATH)
+    except OSError:
+        pass
+    return PRESENTMON_PATH if os.path.isfile(PRESENTMON_PATH) else None
+
+
+def list_processes():
+    """Список запущенных процессов: [(имя.exe, pid), ...] через tasklist."""
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace",
+                             creationflags=CREATE_NO_WINDOW).stdout
+        procs = []
+        for row in csv.reader(io.StringIO(out)):
+            if len(row) >= 2 and row[0].endswith(".exe"):
+                procs.append((row[0], row[1]))
+        procs.sort(key=lambda t: t[0].lower())
+        return procs
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------ счётчики железа
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                ("dwHighDateTime", wintypes.DWORD)]
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def _ft2int(ft):
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def cpu_usage(prev):
+    """Загрузка CPU в % и новое значение-счётчик для следующего вызова."""
+    idle, kernel, user = _FILETIME(), _FILETIME(), _FILETIME()
+    if not ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+        return None, prev
+    cur = (_ft2int(idle), _ft2int(kernel) + _ft2int(user))
+    if prev is None:
+        return None, cur
+    di = cur[0] - prev[0]
+    dt = cur[1] - prev[1]
+    if dt <= 0:
+        return None, cur
+    return max(0.0, min(100.0, 100.0 * (1.0 - di / dt))), cur
+
+
+def ram_info():
+    """(занято %, занято ГБ, всего ГБ)"""
+    m = _MEMORYSTATUSEX()
+    m.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+        return None
+    total = m.ullTotalPhys / 1024 ** 3
+    used = (m.ullTotalPhys - m.ullAvailPhys) / 1024 ** 3
+    return m.dwMemoryLoad, used, total
+
+
+def gpu_usage(pdh_state):
+    """Суммарная загрузка GPU в % через PDH-счётчики. pdh_state — dict для
+    переиспользования сессии; возвращает (значение или None, новое состояние)."""
+    st = pdh_state or {}
+    try:
+        pdh = ctypes.WinDLL("pdh.dll")
+        if "h" not in st:
+            h = ctypes.c_void_p()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(h)) != 0:
+                return None, st
+            st["h"] = h
+            st["pdh"] = pdh
+        pdh = st["pdh"]
+        if "c" not in st:
+            c = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(
+                    st["h"], r"\GPU Engine(*)\Utilization Percentage",
+                    0, ctypes.byref(c)) != 0:
+                return None, st
+            st["c"] = c
+        pdh.PdhCollectQueryData(st["h"])
+        time.sleep(0.25)
+        pdh.PdhCollectQueryData(st["h"])
+
+        size, count = ctypes.c_uint(0), ctypes.c_uint(0)
+        buf = ctypes.c_void_p()
+        PDH_FMT_DOUBLE, PDH_MORE_DATA = 0x200, 0x800007D2
+        r = pdh.PdhGetFormattedCounterArrayW(
+            st["c"], PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count),
+            ctypes.byref(buf), None)
+        if (r & 0xFFFFFFFF) != PDH_MORE_DATA or size.value == 0:
+            return None, st
+        raw = ctypes.create_string_buffer(size.value)
+        r = pdh.PdhGetFormattedCounterArrayW(
+            st["c"], PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count),
+            ctypes.byref(raw), None)
+        if r != 0 or count.value == 0:
+            return None, st
+
+        class FmtVal(ctypes.Structure):
+            _fields_ = [("CStatus", wintypes.DWORD),
+                        ("doubleValue", ctypes.c_double)]
+
+        class FmtItem(ctypes.Structure):
+            _fields_ = [("szName", wintypes.LPWSTR),
+                        ("Value", FmtVal)]
+
+        arr = ctypes.cast(raw, ctypes.POINTER(FmtItem))
+        total = sum(arr[i].Value.doubleValue for i in range(count.value))
+        return max(0.0, min(100.0, total)), st
+    except Exception:
+        return None, st
+
 # ------------------------------------------------------------------ приложение
 
 
@@ -585,6 +737,16 @@ class App(ctk.CTk):
         cleanup_legacy()
         remove_service_artifacts(self.zapret_dir)
 
+        # состояние FPS-монитора и счётчиков железа
+        self._pm_proc = None
+        self._pm_name = None
+        self._fps_queue = queue.Queue()
+        self._fps_hist = deque(maxlen=600)
+        self._cpu_prev = None
+        self._pdh_state = {}
+        self._hw = {"cpu": None, "gpu": None, "ram": None}
+        self._hw_close = False
+
         self._build_sidebar()
         self._build_pages()
         self.show_page("home")
@@ -592,6 +754,9 @@ class App(ctk.CTk):
         self._reload_strategies()
         self._poll_process()
         self._animate_pulse()
+        threading.Thread(target=self._hw_loop, daemon=True).start()
+        self.after(600, self._fps_poll)
+        self.after(1200, self._hw_update)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.after(150, self._apply_dark_titlebar)
@@ -669,6 +834,7 @@ class App(ctk.CTk):
         self.nav_indicators = {}
         for key, label, icon in (("home", "Главная", "⌂"),
                                  ("autostart", "Автозапуск", "↻"),
+                                 ("games", "Игры", "⌘"),
                                  ("theme", "Тема", "◑"),
                                  ("about", "О программе", "ⓘ")):
             wrap = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -771,7 +937,7 @@ class App(ctk.CTk):
         self.page_hosts = {}
         self.content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self.content.pack(side="left", fill="both", expand=True)
-        for key in ("home", "autostart", "theme", "about"):
+        for key in ("home", "autostart", "games", "theme", "about"):
             # прозрачный хост: через него работает слайд-анимация,
             # а снизу (если задан) видна картинка-фон
             self.page_hosts[key] = ctk.CTkFrame(self.content,
@@ -783,6 +949,7 @@ class App(ctk.CTk):
             self.pages[key].pack(fill="both", expand=True, padx=30, pady=26)
         self._build_home()
         self._build_autostart()
+        self._build_games()
         self._build_theme()
         self._build_about()
         self._apply_background()
@@ -1069,6 +1236,307 @@ class App(ctk.CTk):
         except Exception as e:
             self.auto_switch.deselect()
             messagebox.showerror(APP_NAME, f"Ошибка автозапуска:\n{e}")
+
+    # ---------------------------------------------------------------- игры
+
+    def _build_games(self):
+        p = self.pages["games"]
+        ctk.CTkLabel(p, text="Игры", font=ctk.CTkFont(size=25, weight="bold"),
+                     text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(p, text="Живой FPS из движка игры и загрузка железа",
+                     font=ctk.CTkFont(size=13), text_color=MUTED).pack(
+            anchor="w", pady=(4, 0))
+
+        # ---- FPS-монитор
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="x", pady=(18, 0))
+        ctk.CTkLabel(card, text="Ф П С - М О Н И Т О Р",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 8))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=22)
+        self.games_proc_menu = ctk.CTkOptionMenu(
+            row, width=330, height=34, dynamic_resizing=False,
+            fg_color=CARD_HOVER, button_color=BORDER, button_hover_color=ACTIVE_BG,
+            dropdown_fg_color=CARD, dropdown_hover_color=CARD_HOVER,
+            dropdown_text_color=TEXT, text_color=TEXT,
+            font=ctk.CTkFont(size=12))
+        self.games_proc_menu.pack(side="left")
+        self._games_proc_names = {}
+        self._games_refresh_procs()
+        ctk.CTkButton(row, text="обновить список", width=110, height=34,
+                      corner_radius=9, fg_color="transparent",
+                      hover_color=CARD_HOVER, border_width=1, border_color=BORDER,
+                      text_color=MUTED, font=ctk.CTkFont(size=12),
+                      command=self._games_refresh_procs).pack(side="left", padx=(8, 0))
+        self.games_btn = ctk.CTkButton(
+            row, text="начать замер", width=130, height=34, corner_radius=9,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._games_toggle)
+        self.games_btn.pack(side="right")
+
+        # значения
+        st = ctk.CTkFrame(card, fg_color="transparent")
+        st.pack(fill="x", padx=22, pady=(12, 0))
+        self.fps_value = ctk.CTkLabel(st, text="—", width=150,
+                                      font=ctk.CTkFont(size=48, weight="bold"),
+                                      text_color=MUTED, anchor="w")
+        self.fps_value.pack(side="left")
+        det = ctk.CTkFrame(st, fg_color="transparent")
+        det.pack(side="left", padx=(10, 0))
+        self.fps_avg = ctk.CTkLabel(det, text="средний: —",
+                                    font=ctk.CTkFont(size=13), text_color=TEXT,
+                                    anchor="w")
+        self.fps_avg.pack(anchor="w")
+        self.fps_low = ctk.CTkLabel(det, text="1% low: —",
+                                    font=ctk.CTkFont(size=13), text_color=TEXT,
+                                    anchor="w")
+        self.fps_low.pack(anchor="w", pady=(2, 0))
+        self.fps_ms = ctk.CTkLabel(det, text="фреймтайм: —",
+                                   font=ctk.CTkFont(size=13), text_color=MUTED,
+                                   anchor="w")
+        self.fps_ms.pack(anchor="w", pady=(2, 0))
+
+        self.fps_canvas = tk.Canvas(card, height=190, bg=CONSOLE_BG,
+                                    highlightthickness=0, bd=0)
+        self.fps_canvas.pack(fill="x", padx=22, pady=(12, 8))
+        ctk.CTkLabel(card, text=("Замер через PresentMon (Intel): цифры берутся "
+                                 "из движка игры, а не из браузера. Выберите "
+                                 "процесс игры и нажмите «начать замер» — можно "
+                                 "сворачивать grom и играть."),
+                     font=ctk.CTkFont(size=11), text_color=MUTED,
+                     wraplength=760, justify="left").pack(anchor="w", padx=22,
+                                                          pady=(0, 16))
+
+        # ---- загрузка железа
+        card2 = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS,
+                             border_width=1, border_color=BORDER)
+        card2.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(card2, text=" З А Г Р У З К А   П К ",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 10))
+        self._hw_bars = {}
+        for key, title in (("cpu", "процессор"), ("gpu", "видеокарта"),
+                           ("ram", "память")):
+            rw = ctk.CTkFrame(card2, fg_color="transparent")
+            rw.pack(fill="x", padx=22, pady=(0, 6))
+            ctk.CTkLabel(rw, text=title, width=90, anchor="w",
+                         font=ctk.CTkFont(size=12), text_color=MUTED).pack(
+                side="left")
+            bar = ctk.CTkProgressBar(rw, height=14, progress_color=ACCENT,
+                                     fg_color=BORDER)
+            bar.pack(side="left", fill="x", expand=True, padx=10)
+            bar.set(0)
+            val = ctk.CTkLabel(rw, text="—", width=130, anchor="e",
+                               font=ctk.CTkFont(size=12), text_color=TEXT)
+            val.pack(side="left")
+            self._hw_bars[key] = (bar, val)
+        ctk.CTkFrame(card2, height=10, fg_color="transparent").pack()
+
+    def _games_refresh_procs(self):
+        procs = list_processes()
+        self._games_proc_names = {}
+        values = []
+        for name, pid in procs:
+            label = f"{name} ({pid})"
+            self._games_proc_names[label] = name
+            values.append(label)
+        if not values:
+            values = ["— процессы не найдены —"]
+        self.games_proc_menu.configure(values=values)
+        saved = self.cfg.get("games_process")
+        if saved in self._games_proc_names:
+            self.games_proc_menu.set(saved)
+        elif values and self.games_proc_menu.get() not in self._games_proc_names:
+            self.games_proc_menu.set(values[0])
+
+    def _games_toggle(self):
+        if self._pm_proc:
+            self._games_stop()
+        else:
+            self._games_start()
+
+    def _games_start(self):
+        pm = ensure_presentmon()
+        if not pm:
+            messagebox.showerror(APP_NAME, "PresentMon не найден. Переустановите "
+                                           "grom или скачайте заново.")
+            return
+        if not is_admin():
+            messagebox.showwarning(
+                APP_NAME, "Для замера FPS нужны права администратора.\n"
+                          "Перезапустите grom от имени администратора.")
+            return
+        label = self.games_proc_menu.get()
+        name = self._games_proc_names.get(label)
+        if not name:
+            messagebox.showwarning(APP_NAME, "Выберите процесс игры из списка.")
+            return
+        self.cfg["games_process"] = label
+        save_config(self.cfg)
+        try:
+            self._pm_proc = subprocess.Popen(
+                [pm, "-process_name", name, "-output_stdout",
+                 "-no_console_stats", "-terminate_on_proc_exit"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            self._pm_proc = None
+            messagebox.showerror(APP_NAME, f"Не удалось запустить замер:\n{e}")
+            return
+        self._pm_name = name
+        self._fps_hist.clear()
+        while not self._fps_queue.empty():
+            try:
+                self._fps_queue.get_nowait()
+            except queue.Empty:
+                break
+        threading.Thread(target=self._fps_reader, daemon=True).start()
+        self.games_btn.configure(text="остановить замер", fg_color=RED,
+                                 hover_color="#E1495A")
+        self._log(f"FPS-монитор: замер «{name}» запущен.")
+
+    def _games_stop(self, ended=False):
+        proc, self._pm_proc = self._pm_proc, None
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if self._pm_name:
+            self._log(f"FPS-монитор: замер «{self._pm_name}» "
+                      f"{'завершён — игра закрыта' if ended else 'остановлен'}.")
+        try:
+            self.games_btn.configure(text="начать замер", fg_color=ACCENT,
+                                     hover_color=ACCENT_HOVER)
+        except Exception:
+            pass
+
+    def _fps_reader(self):
+        """Читает CSV PresentMon в отдельном потоке, кладёт фреймтаймы в очередь."""
+        proc = self._pm_proc
+        if not proc or not proc.stdout:
+            return
+        idx = None
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("Application,"):
+                try:
+                    idx = next(csv.reader([line])).index("MsBetweenPresents")
+                except (ValueError, StopIteration):
+                    idx = None
+                continue
+            if idx is None:
+                continue
+            parts = line.split(",")
+            if len(parts) <= idx:
+                continue
+            try:
+                ft = float(parts[idx])
+            except ValueError:
+                continue
+            if 0.0 < ft < 5000.0:
+                self._fps_queue.put(ft)
+        # поток закончил читать — процесс умер (закрылась игра или замер)
+        if self._pm_proc is proc:
+            try:
+                self.after(0, self._games_stop, True)
+            except Exception:
+                pass
+
+    def _fps_poll(self):
+        try:
+            while True:
+                self._fps_hist.append(self._fps_queue.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            if self._fps_hist:
+                self._update_fps_labels()
+                self._draw_fps_graph()
+        except Exception:
+            pass
+        self.after(250, self._fps_poll)
+
+    def _update_fps_labels(self):
+        data = list(self._fps_hist)
+        ft = data[-1]
+        cur = 1000.0 / ft
+        avg = sum(1000.0 / x for x in data) / len(data)
+        low = None
+        if len(data) >= 40:
+            slow = sorted(data, reverse=True)[: max(1, len(data) // 100)]
+            low = 1000.0 / (sum(slow) / len(slow))
+        color = GREEN if ft <= 17.5 else (AMBER if ft <= 34 else RED)
+        self.fps_value.configure(text=f"{cur:.0f}", text_color=color)
+        self.fps_avg.configure(text=f"средний: {avg:.0f} FPS")
+        self.fps_low.configure(text=(f"1% low: {low:.0f} FPS" if low
+                                     else "1% low: —"))
+        self.fps_ms.configure(text=f"фреймтайм: {ft:.1f} мс")
+
+    def _draw_fps_graph(self):
+        cv = self.fps_canvas
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 60 or h < 30:
+            return
+        cv.delete("all")
+        data = list(self._fps_hist)
+        n = min(len(data), max(60, w // 3))
+        data = data[-n:]
+        ymax = max(40.0, max(data) * 1.12)
+        top, bottom = 10, h - 6
+        for ms, txt in ((16.7, "60 fps"), (33.3, "30 fps")):
+            if ms < ymax:
+                y = bottom - (ms / ymax) * (bottom - top)
+                cv.create_line(0, y, w, y, fill="#202636", dash=(3, 4))
+                cv.create_text(8, y - 7, text=txt, fill=MUTED, anchor="w",
+                               font=("Segoe UI", 9))
+        if len(data) >= 2:
+            step = w / max(1, len(data) - 1)
+            pts = []
+            for i, v in enumerate(data):
+                y = bottom - (min(v, ymax) / ymax) * (bottom - top)
+                pts += [i * step, y]
+            cv.create_line(*pts, fill=ACCENT, width=2, smooth=True)
+        cv.create_text(w - 10, 12, text=f"{data[-1]:.1f} мс",
+                       fill=MUTED, anchor="e", font=("Segoe UI", 10))
+
+    # ---- загрузка железа (фоновый поток + обновление виджетов)
+
+    def _hw_loop(self):
+        while not getattr(self, "_hw_close", False):
+            cpu, self._cpu_prev = cpu_usage(self._cpu_prev)
+            gpu, self._pdh_state = gpu_usage(self._pdh_state)
+            ram = ram_info()
+            self._hw = {"cpu": cpu, "gpu": gpu, "ram": ram}
+            time.sleep(1.0)
+
+    def _hw_update(self):
+        try:
+            hw = getattr(self, "_hw", {})
+            cpu, gpu, ram = hw.get("cpu"), hw.get("gpu"), hw.get("ram")
+            if cpu is not None:
+                bar, val = self._hw_bars["cpu"]
+                bar.set(cpu / 100.0)
+                val.configure(text=f"{cpu:.0f}%")
+            if gpu is not None:
+                bar, val = self._hw_bars["gpu"]
+                bar.set(gpu / 100.0)
+                val.configure(text=f"{gpu:.0f}%")
+            if ram is not None:
+                pct, used, total = ram
+                bar, val = self._hw_bars["ram"]
+                bar.set(pct / 100.0)
+                val.configure(text=f"{pct:.0f}% · {used:.1f}/{total:.0f} ГБ")
+        except Exception:
+            pass
+        self.after(1000, self._hw_update)
 
     # ---------------------------------------------------------------- тема
 
@@ -1636,6 +2104,13 @@ class App(ctk.CTk):
                 self.destroy()
 
     def _on_close(self):
+        self._hw_close = True
+        if self._pm_proc:
+            try:
+                self._pm_proc.kill()
+            except Exception:
+                pass
+            self._pm_proc = None
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
         save_config(self.cfg)
