@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-grom — обёртка над winws (zapret) для Windows. v1.5
+grom обходник — обёртка над winws (zapret) для Windows. v1.6
 
 * Тёмный интерфейс, без консольных окон
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
-* Одна круглая кнопка запуска/остановки обхода с пульсацией
+* Идеально круглая кнопка запуска с плавными анимациями
+* Анимации страниц, меню и статусов
 * Автозапуск обхода при открытии программы и при входе в Windows
 * Внутри встроен дистрибутив zapret — работает и без папки zapret на ПК
 * Всё в одном exe: pyinstaller --onefile --noconsole zapret_gui.py
@@ -12,6 +13,7 @@ grom — обёртка над winws (zapret) для Windows. v1.5
 
 import ctypes
 import json
+import math
 import os
 import re
 import shutil
@@ -24,8 +26,8 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-APP_NAME = "grom"
-VERSION = "1.5"
+APP_NAME = "grom обходник"
+VERSION = "1.6"
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -61,6 +63,102 @@ ACCENT_BRIGHT = "#221D50"
 RED_DIM = "#3B2029"
 GREEN_DIM = "#1F9A57"
 AMBER_DIM = "#C98F3E"
+
+
+def hex_to_rgb(c):
+    c = str(c)
+    return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def rgb_to_hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def lerp_color(c1, c2, t):
+    """Плавная интерполяция между двумя hex-цветами."""
+    try:
+        a, b = hex_to_rgb(c1), hex_to_rgb(c2)
+    except Exception:
+        return str(c2)
+    return rgb_to_hex(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def lighten(color, amt):
+    r, g, b = hex_to_rgb(color)
+    return rgb_to_hex((r + amt, g + amt, b + amt))
+
+
+class CircleButton(tk.Frame):
+    """Идеально круглая кнопка запуска/остановки.
+
+    Рисуется на tk.Canvas в реальных пикселях — не зависит от масштаба DPI,
+    поэтому всегда круглая. Имеет дыхание подсветки, эффект нажатия и
+    плавную смену цвета при старте/остановке.
+    """
+
+    def __init__(self, master, command=None, size=118, ring=16):
+        r_total = size + ring * 2
+        super().__init__(master, width=r_total, height=r_total, bg=CARD,
+                         bd=0, highlightthickness=0)
+        self.pack_propagate(False)
+        self.command = command
+        self.running = False
+        self._hover = False
+        self._press = 0.0
+        self._t = 0.0
+        self.canvas = tk.Canvas(self, width=r_total, height=r_total, bg=CARD,
+                                highlightthickness=0, bd=0, cursor="hand2")
+        self.canvas.pack()
+        self._glow = self.canvas.create_oval(
+            0, 0, r_total - 1, r_total - 1, fill=ACCENT_DIM, outline="")
+        self._btn = self.canvas.create_oval(
+            ring, ring, r_total - ring - 1, r_total - ring - 1,
+            fill=ACCENT, outline="")
+        self._glyph = self.canvas.create_text(
+            r_total / 2, r_total / 2, text="▶", fill="#FFFFFF",
+            font=("Segoe UI", 40, "bold"))
+        self.canvas.bind("<Enter>", lambda e: self._set_hover(True))
+        self.canvas.bind("<Leave>", lambda e: self._set_hover(False))
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.after(45, self._tick)
+
+    def _set_hover(self, v):
+        self._hover = v
+        try:
+            self.canvas.config(cursor="hand2" if v else "")
+        except tk.TclError:
+            pass
+
+    def set_running(self, running):
+        self.running = bool(running)
+        try:
+            self.canvas.itemconfig(
+                self._glyph, text="■" if self.running else "▶",
+                font=("Segoe UI", 33 if self.running else 40, "bold"))
+        except tk.TclError:
+            pass
+
+    def _on_click(self, _event):
+        self._press = 1.0
+        if self.command:
+            self.command()
+
+    def _tick(self):
+        try:
+            self._t += 0.11
+            s = (math.sin(self._t) + 1) / 2
+            self._press *= 0.80
+            if self.running:
+                glow = lerp_color(TINT_RED, RED_DIM, s)
+                base = "#E04553" if self._hover else RED
+            else:
+                glow = lerp_color(ACCENT_DIM, ACCENT_BRIGHT, s)
+                base = ACCENT_HOVER if self._hover else ACCENT
+            self.canvas.itemconfig(self._glow, fill=glow)
+            self.canvas.itemconfig(self._btn, fill=lighten(base, self._press * 46))
+        except tk.TclError:
+            return
+        self.after(45, self._tick)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -403,7 +501,9 @@ class App(ctk.CTk):
         self.strategies = []          # [{source, name, args}]
         self.selected = None
         self.autorun_mode = autorun
-        self._pulse = False
+        self._pulse_t = 0.0
+        self._shown_running = False
+        self._current_page = None
         self.cfg = load_config()
         self.cfg.pop("services", None)
 
@@ -466,6 +566,7 @@ class App(ctk.CTk):
                              corner_radius=14)
         badge.pack(side="left")
         badge.pack_propagate(False)
+        self.logo_badge = badge
         self._logo_image = None
         try:
             if os.path.isfile(ICON_PATH):
@@ -477,23 +578,30 @@ class App(ctk.CTk):
         except Exception:
             pass
         if self._logo_image:
-            ctk.CTkLabel(badge, image=self._logo_image, text="").pack(expand=True)
+            self.logo_badge_glyph = ctk.CTkLabel(badge, image=self._logo_image, text="")
+            self.logo_badge_glyph.pack(expand=True)
         else:
-            ctk.CTkLabel(badge, text="⚡", font=ctk.CTkFont(size=21),
-                         text_color="#FFFFFF").pack(expand=True)
+            self.logo_badge_glyph = ctk.CTkLabel(badge, text="⚡",
+                                                 font=ctk.CTkFont(size=21),
+                                                 text_color="#FFFFFF")
+            self.logo_badge_glyph.pack(expand=True)
         names = ctk.CTkFrame(logo, fg_color="transparent")
         names.pack(side="left", padx=(12, 0))
-        ctk.CTkLabel(names, text="grom", font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(names, text=f"обход DPI · v{VERSION}",
-                     font=ctk.CTkFont(size=10), text_color=MUTED).pack(anchor="w")
+        self.logo_name = ctk.CTkLabel(names, text="grom",
+                                      font=ctk.CTkFont(size=22, weight="bold"),
+                                      text_color=TEXT)
+        self.logo_name.pack(anchor="w")
+        self.logo_sub = ctk.CTkLabel(names, text=f"обходник · v{VERSION}",
+                                     font=ctk.CTkFont(size=10),
+                                     text_color=ACTIVE_TEXT)
+        self.logo_sub.pack(anchor="w")
 
         # ---- разделитель и заголовок раздела
         ctk.CTkFrame(self.sidebar, height=1, fg_color=BORDER).pack(
             fill="x", padx=20, pady=(22, 16))
-        ctk.CTkLabel(self.sidebar, text="М Е Н Ю", font=ctk.CTkFont(
-            size=10, weight="bold"), text_color="#4A5165").pack(
-            anchor="w", padx=28, pady=(0, 10))
+        self.menu_caption = ctk.CTkLabel(self.sidebar, text="М Е Н Ю", font=ctk.CTkFont(
+            size=10, weight="bold"), text_color="#4A5165")
+        self.menu_caption.pack(anchor="w", padx=28, pady=(0, 10))
 
         # ---- пункты навигации с индикатором активного раздела
         self.nav_buttons = {}
@@ -519,6 +627,7 @@ class App(ctk.CTk):
         bottom = ctk.CTkFrame(self.sidebar, fg_color=CARD, corner_radius=14,
                               border_width=1, border_color=BORDER)
         bottom.pack(side="bottom", fill="x", padx=16, pady=18)
+        self.status_card = bottom
         row = ctk.CTkFrame(bottom, fg_color="transparent")
         row.pack(fill="x", padx=15, pady=(14, 0))
         self.side_status_dot = ctk.CTkLabel(row, text="●", text_color=MUTED,
@@ -536,34 +645,127 @@ class App(ctk.CTk):
             text_color=GREEN if is_admin() else AMBER,
             font=ctk.CTkFont(size=11, weight="bold"))
         self.admin_label.pack(anchor="w", padx=15, pady=(0, 14))
+        self.after(120, self._materialize_sidebar)
+
+    def _materialize_sidebar(self):
+        """Плавное «проявление» элементов сайдбара при старте."""
+        seq = [(0, self.logo_badge, "fg_color", ACCENT),
+               (70, self.logo_name, "text_color", TEXT),
+               (140, self.logo_sub, "text_color", ACTIVE_TEXT),
+               (210, self.menu_caption, "text_color", "#4A5165")]
+        for i, (key, b) in enumerate(self.nav_buttons.items()):
+            target = ACTIVE_TEXT if key == self._current_page else MUTED
+            seq.append((280 + i * 70, b, "text_color", target))
+        seq.append((530, self.status_card, "fg_color", CARD))
+        seq.append((560, self.side_status_text, "text_color", MUTED))
+        seq.append((590, self.admin_label, "text_color",
+                    GREEN if is_admin() else AMBER))
+        for delay, w, prop, target in seq:
+            self._fade_in(w, prop, target, delay)
+
+    def _fade_in(self, widget, prop, target, delay=0, ms=430, steps=15):
+        """Показывает элемент, плавно меняя цвет из «сливания с фоном»."""
+        start = SIDEBAR
+
+        def begin():
+            def step(i=0):
+                t = min(1, i / steps)
+                e = 1 - (1 - t) ** 3
+                try:
+                    widget.configure(**{prop: lerp_color(start, target, e)})
+                except tk.TclError:
+                    return
+                if t < 1:
+                    self.after(max(1, ms // steps), step, i + 1)
+            step()
+        self.after(delay, begin)
+
+    def _fade(self, widget, to, ms=340, steps=14):
+        """Плавный переход свойств (цветов) у виджета."""
+        frm = {}
+        for p in to:
+            try:
+                v = str(widget.cget(p))
+            except Exception:
+                v = ""
+            frm[p] = v if v.startswith("#") else to[p]
+
+        def step(i=0):
+            t = min(1, i / steps)
+            e = 1 - (1 - t) ** 2
+            for p, v in to.items():
+                try:
+                    widget.configure(**{p: lerp_color(frm[p], v, e)})
+                except tk.TclError:
+                    pass
+            if t < 1:
+                self.after(max(1, ms // steps), step, i + 1)
+        step()
 
     # ---------------------------------------------------------------- страницы
 
     def _build_pages(self):
         self.pages = {}
+        self.page_hosts = {}
         self.content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self.content.pack(side="left", fill="both", expand=True)
         for key in ("home", "autostart", "about"):
-            self.pages[key] = ctk.CTkFrame(self.content, fg_color=BG, corner_radius=0)
+            # обычный tk.Frame-хост: через него работает слайд-анимация
+            self.page_hosts[key] = tk.Frame(self.content, bg=BG)
+            self.pages[key] = ctk.CTkFrame(self.page_hosts[key], fg_color=BG,
+                                           corner_radius=0)
+            self.pages[key].pack(fill="both", expand=True, padx=30, pady=26)
         self._build_home()
         self._build_autostart()
         self._build_about()
 
     def show_page(self, key):
+        if key == self._current_page:
+            return
+        self._current_page = key
         for k, page in self.pages.items():
-            page.pack_forget()
+            self.page_hosts[k].place_forget()
             btn = self.nav_buttons[k]
             ind = self.nav_indicators[k]
             if k == key:
-                ind.configure(fg_color=ACCENT)
+                ind.configure(fg_color=ACCENT, height=6)
+                self._anim_indicator(ind)
                 btn.configure(fg_color=ACTIVE_BG, hover_color=ACTIVE_BG,
                               text_color=ACTIVE_TEXT,
                               font=ctk.CTkFont(size=13, weight="bold"))
             else:
-                ind.configure(fg_color="transparent")
+                ind.configure(fg_color="transparent", height=24)
                 btn.configure(fg_color="transparent", hover_color=CARD_HOVER,
                               text_color=MUTED, font=ctk.CTkFont(size=13))
-        self.pages[key].pack(fill="both", expand=True, padx=30, pady=26)
+        host = self.page_hosts[key]
+        host.place(relx=0, rely=0, relwidth=1, relheight=1, x=26)
+        # мягкий выезд страницы справа
+        start = 26
+        steps = 13
+
+        def slide(i=1):
+            t = min(1, i / steps)
+            e = 1 - (1 - t) ** 3
+            try:
+                host.place_configure(x=int(start * (1 - e)))
+            except tk.TclError:
+                return
+            if t < 1:
+                self.after(16, slide, i + 1)
+        slide()
+
+    def _anim_indicator(self, ind, steps=10):
+        """Индикатор активного пункта меню плавно вырастает по высоте."""
+        def step(i=1):
+            t = min(1, i / steps)
+            e = 1 - (1 - t) ** 2
+            try:
+                ind.configure(height=int(6 + 18 * e))
+            except tk.TclError:
+                return
+            if t < 1:
+                self.after(18, step, i + 1)
+        step()
 
     # ---------------------------------------------------------------- главная
 
@@ -617,23 +819,16 @@ class App(ctk.CTk):
             command=self._open_strategy_editor)
         self.btn_settings.pack(side="right")
 
-        # ---- круглая кнопка запуска/остановки
-        ctrl = ctk.CTkFrame(hero, fg_color="transparent", height=172)
-        ctrl.pack(fill="x", pady=(24, 0))
+        # ---- круглая кнопка запуска/остановки (настоящий круг на Canvas)
+        ctrl = ctk.CTkFrame(hero, fg_color="transparent", height=196)
+        ctrl.pack(fill="x", pady=(20, 0))
         ctrl.pack_propagate(False)
-        self.power_glow = ctk.CTkFrame(ctrl, width=136, height=136,
-                                       corner_radius=68, fg_color="#141233")
-        self.power_glow.place(relx=0.5, y=76, anchor="center")
-        self.btn_power = ctk.CTkButton(
-            ctrl, text="▶", width=114, height=114, corner_radius=57,
-            fg_color=ACCENT, hover_color=ACCENT_HOVER, border_width=0,
-            text_color="#FFFFFF", font=ctk.CTkFont(size=42),
-            command=self._toggle_power)
-        self.btn_power.place(relx=0.5, y=76, anchor="center")
+        self.power_btn = CircleButton(ctrl, command=self._toggle_power)
+        self.power_btn.place(relx=0.5, y=88, anchor="center")
         self.power_caption = ctk.CTkLabel(
             ctrl, text="запустить обход", font=ctk.CTkFont(size=13, weight="bold"),
             text_color=MUTED)
-        self.power_caption.place(relx=0.5, y=150, anchor="n")
+        self.power_caption.place(relx=0.5, y=172, anchor="n")
 
         # ---- автозапуск обхода при открытии
         abrow = ctk.CTkFrame(hero, fg_color="transparent")
@@ -996,37 +1191,45 @@ class App(ctk.CTk):
 
     def _poll_process(self):
         running = bool(self.proc and self.proc.poll() is None)
-        if running:
-            self.side_status_text.configure(text="обход работает", text_color=TEXT)
-            self.btn_power.configure(text="■", fg_color=RED, hover_color="#E04553",
-                                     font=ctk.CTkFont(size=34))
-            self.power_caption.configure(text="остановить обход", text_color="#FF9AA5")
-            self.status_pill.configure(fg_color=TINT_GREEN, border_color="#1E4433")
-            self.status_text.configure(text="работает", text_color=GREEN)
-        else:
-            self.side_status_text.configure(text="winws не запущен", text_color=MUTED)
-            self.btn_power.configure(text="▶", fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                                     font=ctk.CTkFont(size=42))
-            self.power_caption.configure(text="запустить обход", text_color=MUTED)
-            self.status_pill.configure(fg_color=TINT_AMBER, border_color="#3D3418")
-            self.status_text.configure(text="не запущен", text_color=AMBER)
-        self.after(500, self._poll_process)
+        if running != self._shown_running:
+            self._shown_running = running
+            self.power_btn.set_running(running)
+            if running:
+                self.power_caption.configure(text="остановить обход")
+                self._fade(self.power_caption, {"text_color": "#FF9AA5"})
+                self.side_status_text.configure(text="обход работает",
+                                                text_color=TEXT)
+                self.status_text.configure(text="работает", text_color=GREEN)
+                self._fade(self.status_pill, {"fg_color": TINT_GREEN,
+                                              "border_color": "#1E4433"})
+            else:
+                self.power_caption.configure(text="запустить обход")
+                self._fade(self.power_caption, {"text_color": MUTED})
+                self.side_status_text.configure(text="winws не запущен",
+                                                text_color=MUTED)
+                self.status_text.configure(text="не запущен", text_color=AMBER)
+                self._fade(self.status_pill, {"fg_color": TINT_AMBER,
+                                              "border_color": "#3D3418"})
+        self.after(120, self._poll_process)
 
     def _animate_pulse(self):
-        """Мягкая пульсация ореола кнопки и статусных точек."""
-        self._pulse = not self._pulse
+        """Плавная пульсация статусных точек (синус, без рывков)."""
+        self._pulse_t += 0.085
+        s = (math.sin(self._pulse_t) + 1) / 2
         running = bool(self.proc and self.proc.poll() is None)
-        if running:
-            self.power_glow.configure(fg_color=RED_DIM if self._pulse else TINT_RED)
-            self.side_status_dot.configure(
-                text_color=GREEN if self._pulse else GREEN_DIM)
-            self.status_dot.configure(text_color="#FF8A95" if self._pulse else RED)
-        else:
-            self.power_glow.configure(
-                fg_color=ACCENT_BRIGHT if self._pulse else ACCENT_DIM)
-            self.side_status_dot.configure(text_color=MUTED)
-            self.status_dot.configure(text_color=AMBER if self._pulse else AMBER_DIM)
-        self.after(750, self._animate_pulse)
+        try:
+            if running:
+                self.side_status_dot.configure(
+                    text_color=lerp_color(GREEN_DIM, GREEN, s))
+                self.status_dot.configure(
+                    text_color=lerp_color(RED, "#FF8A95", s))
+            else:
+                self.side_status_dot.configure(text_color=MUTED)
+                self.status_dot.configure(
+                    text_color=lerp_color(AMBER_DIM, AMBER, s))
+        except tk.TclError:
+            return
+        self.after(60, self._animate_pulse)
 
     def _ask_elevation(self):
         if messagebox.askyesno(
