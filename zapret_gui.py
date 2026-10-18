@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.9
+grom обходник — обёртка над winws (zapret) для Windows. v1.10
 
 * Тёмный интерфейс, без консольных окон
-* Новая иконка и обновлённый дизайн (чипы меню, стеклянный логотип,
+* Новая VPN-страница (как в happ): подписка, список серверов, обновление,
+  проверка пинга, подключение через встроенный sing-box + системный прокси
+* Обновлённая иконка и дизайн (чипы меню, стеклянный логотип,
   градиентные акценты, кольцо-гロー у круглой кнопки)
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
 * Идеально круглая кнопка запуска с плавными анимациями
 * Анимации страниц, меню и статусов
 * Вкладка «Тема»: цветовые темы, свой акцент, фон-картинка, скругление
-* Вкладка «Игры»: живой FPS/фреймтайм (PresentMon) + загрузка CPU/GPU/ОЗУ
+* Вкладка «Игры»: загрузка CPU/GPU/ОЗУ в реальном времени (без FPS-монитора)
 * Автозапуск обхода при открытии программы и при входе в Windows
 * Внутри встроен дистрибутив zapret — работает и без папки zapret на ПК
 * Всё в одном exe: pyinstaller --onefile --noconsole zapret_gui.py
 """
 
 import ctypes
-import csv
-import io
-from collections import deque
 import json
 import math
 import os
-import queue
 import re
 import shutil
 import subprocess
@@ -36,8 +34,10 @@ from tkinter import colorchooser, filedialog, messagebox
 import customtkinter as ctk
 from PIL import Image, ImageOps
 
+import vpn_core
+
 APP_NAME = "grom обходник"
-VERSION = "1.9"
+VERSION = "1.10"
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -561,48 +561,6 @@ def ensure_embedded_zapret():
         pass
     return find_winws(EMBEDDED_DIR) and EMBEDDED_DIR
 
-# ------------------------------------------------- встроенный PresentMon (FPS)
-
-
-PRESENTMON_BUNDLE = os.path.join(getattr(sys, "_MEIPASS",
-                                          os.path.dirname(os.path.abspath(__file__))),
-                                 "tools", "PresentMon.exe")
-PRESENTMON_PATH = os.path.join(_local_data_dir(), "tools", "PresentMon.exe")
-
-
-def ensure_presentmon():
-    """Распаковать встроенный PresentMon в %LOCALAPPDATA%\\grom\\tools.
-
-    Возвращает путь к exe или None.
-    """
-    try:
-        if os.path.isfile(PRESENTMON_BUNDLE):
-            os.makedirs(os.path.dirname(PRESENTMON_PATH), exist_ok=True)
-            if (not os.path.isfile(PRESENTMON_PATH)
-                    or os.path.getsize(PRESENTMON_PATH)
-                    != os.path.getsize(PRESENTMON_BUNDLE)):
-                shutil.copy2(PRESENTMON_BUNDLE, PRESENTMON_PATH)
-    except OSError:
-        pass
-    return PRESENTMON_PATH if os.path.isfile(PRESENTMON_PATH) else None
-
-
-def list_processes():
-    """Список запущенных процессов: [(имя.exe, pid), ...] через tasklist."""
-    try:
-        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, encoding="utf-8",
-                             errors="replace",
-                             creationflags=CREATE_NO_WINDOW).stdout
-        procs = []
-        for row in csv.reader(io.StringIO(out)):
-            if len(row) >= 2 and row[0].endswith(".exe"):
-                procs.append((row[0], row[1]))
-        procs.sort(key=lambda t: t[0].lower())
-        return procs
-    except Exception:
-        return []
-
 
 # ------------------------------------------------------------ счётчики железа
 
@@ -747,15 +705,24 @@ class App(ctk.CTk):
         cleanup_legacy()
         remove_service_artifacts(self.zapret_dir)
 
-        # состояние FPS-монитора и счётчиков железа
-        self._pm_proc = None
-        self._pm_name = None
-        self._fps_queue = queue.Queue()
-        self._fps_hist = deque(maxlen=600)
+        # состояние счётчиков железа
         self._cpu_prev = None
         self._pdh_state = {}
         self._hw = {"cpu": None, "gpu": None, "ram": None}
         self._hw_close = False
+
+        # состояние VPN (подписка, серверы, подключение)
+        vcfg = self.cfg.get("vpn") or {}
+        self._vpn_sub_url = str(vcfg.get("sub_url") or "")
+        self._vpn_sel_link = str(vcfg.get("selected_link") or "")
+        self._vpn_servers = []        # записи parse_link
+        self._vpn_pings = {}          # link -> мс или None
+        self._vpn_rows = []           # (frame, dot, ping_label, rec)
+        self._vpn_proc = None
+        self._vpn_port = None
+        self._vpn_proxy_state = None
+        self._vpn_busy = False
+        self._vpn_updated = None      # время последнего обновления
 
         self._build_sidebar()
         self._build_pages()
@@ -765,7 +732,6 @@ class App(ctk.CTk):
         self._poll_process()
         self._animate_pulse()
         threading.Thread(target=self._hw_loop, daemon=True).start()
-        self.after(600, self._fps_poll)
         self.after(1200, self._hw_update)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -866,6 +832,7 @@ class App(ctk.CTk):
         self.nav_chip_glyphs = {}
         for key, label, icon in (("home", "Главная", "⌂"),
                                  ("autostart", "Автозапуск", "↻"),
+                                 ("vpn", "VPN", "◉"),
                                  ("games", "Игры", "⌘"),
                                  ("theme", "Тема", "◑"),
                                  ("about", "О программе", "ⓘ")):
@@ -983,7 +950,7 @@ class App(ctk.CTk):
         self.page_hosts = {}
         self.content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self.content.pack(side="left", fill="both", expand=True)
-        for key in ("home", "autostart", "games", "theme", "about"):
+        for key in ("home", "autostart", "vpn", "games", "theme", "about"):
             # прозрачный хост: через него работает слайд-анимация,
             # а снизу (если задан) видна картинка-фон
             self.page_hosts[key] = ctk.CTkFrame(self.content,
@@ -995,6 +962,7 @@ class App(ctk.CTk):
             self.pages[key].pack(fill="both", expand=True, padx=30, pady=26)
         self._build_home()
         self._build_autostart()
+        self._build_vpn()
         self._build_games()
         self._build_theme()
         self._build_about()
@@ -1301,78 +1269,15 @@ class App(ctk.CTk):
         p = self.pages["games"]
         ctk.CTkLabel(p, text="Игры", font=ctk.CTkFont(size=25, weight="bold"),
                      text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(p, text="Живой FPS из движка игры и загрузка железа",
+        ctk.CTkLabel(p, text="Загрузка процессора, видеокарты и памяти "
+                             "в реальном времени",
                      font=ctk.CTkFont(size=13), text_color=MUTED).pack(
             anchor="w", pady=(4, 0))
-
-        # ---- FPS-монитор
-        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS,
-                            border_width=1, border_color=BORDER)
-        card.pack(fill="x", pady=(18, 0))
-        ctk.CTkLabel(card, text="Ф П С - М О Н И Т О Р",
-                     font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 8))
-
-        row = ctk.CTkFrame(card, fg_color="transparent")
-        row.pack(fill="x", padx=22)
-        self.games_proc_menu = ctk.CTkOptionMenu(
-            row, width=330, height=34, dynamic_resizing=False,
-            fg_color=CARD_HOVER, button_color=BORDER, button_hover_color=ACTIVE_BG,
-            dropdown_fg_color=CARD, dropdown_hover_color=CARD_HOVER,
-            dropdown_text_color=TEXT, text_color=TEXT,
-            font=ctk.CTkFont(size=12))
-        self.games_proc_menu.pack(side="left")
-        self._games_proc_names = {}
-        self._games_refresh_procs()
-        ctk.CTkButton(row, text="обновить список", width=110, height=34,
-                      corner_radius=9, fg_color="transparent",
-                      hover_color=CARD_HOVER, border_width=1, border_color=BORDER,
-                      text_color=MUTED, font=ctk.CTkFont(size=12),
-                      command=self._games_refresh_procs).pack(side="left", padx=(8, 0))
-        self.games_btn = ctk.CTkButton(
-            row, text="начать замер", width=130, height=34, corner_radius=9,
-            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            command=self._games_toggle)
-        self.games_btn.pack(side="right")
-
-        # значения
-        st = ctk.CTkFrame(card, fg_color="transparent")
-        st.pack(fill="x", padx=22, pady=(12, 0))
-        self.fps_value = ctk.CTkLabel(st, text="—", width=150,
-                                      font=ctk.CTkFont(size=48, weight="bold"),
-                                      text_color=MUTED, anchor="w")
-        self.fps_value.pack(side="left")
-        det = ctk.CTkFrame(st, fg_color="transparent")
-        det.pack(side="left", padx=(10, 0))
-        self.fps_avg = ctk.CTkLabel(det, text="средний: —",
-                                    font=ctk.CTkFont(size=13), text_color=TEXT,
-                                    anchor="w")
-        self.fps_avg.pack(anchor="w")
-        self.fps_low = ctk.CTkLabel(det, text="1% low: —",
-                                    font=ctk.CTkFont(size=13), text_color=TEXT,
-                                    anchor="w")
-        self.fps_low.pack(anchor="w", pady=(2, 0))
-        self.fps_ms = ctk.CTkLabel(det, text="фреймтайм: —",
-                                   font=ctk.CTkFont(size=13), text_color=MUTED,
-                                   anchor="w")
-        self.fps_ms.pack(anchor="w", pady=(2, 0))
-
-        self.fps_canvas = tk.Canvas(card, height=190, bg=CONSOLE_BG,
-                                    highlightthickness=0, bd=0)
-        self.fps_canvas.pack(fill="x", padx=22, pady=(12, 8))
-        ctk.CTkLabel(card, text=("Замер через PresentMon (Intel): цифры берутся "
-                                 "из движка игры, а не из браузера. Выберите "
-                                 "процесс игры и нажмите «начать замер» — можно "
-                                 "сворачивать grom и играть."),
-                     font=ctk.CTkFont(size=11), text_color=MUTED,
-                     wraplength=760, justify="left").pack(anchor="w", padx=22,
-                                                          pady=(0, 16))
 
         # ---- загрузка железа
         card2 = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS,
                              border_width=1, border_color=BORDER)
-        card2.pack(fill="x", pady=(14, 0))
+        card2.pack(fill="x", pady=(18, 0))
         ctk.CTkLabel(card2, text=" З А Г Р У З К А   П К ",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 10))
@@ -1393,177 +1298,6 @@ class App(ctk.CTk):
             val.pack(side="left")
             self._hw_bars[key] = (bar, val)
         ctk.CTkFrame(card2, height=10, fg_color="transparent").pack()
-
-    def _games_refresh_procs(self):
-        procs = list_processes()
-        self._games_proc_names = {}
-        values = []
-        for name, pid in procs:
-            label = f"{name} ({pid})"
-            self._games_proc_names[label] = name
-            values.append(label)
-        if not values:
-            values = ["— процессы не найдены —"]
-        self.games_proc_menu.configure(values=values)
-        saved = self.cfg.get("games_process")
-        if saved in self._games_proc_names:
-            self.games_proc_menu.set(saved)
-        elif values and self.games_proc_menu.get() not in self._games_proc_names:
-            self.games_proc_menu.set(values[0])
-
-    def _games_toggle(self):
-        if self._pm_proc:
-            self._games_stop()
-        else:
-            self._games_start()
-
-    def _games_start(self):
-        pm = ensure_presentmon()
-        if not pm:
-            messagebox.showerror(APP_NAME, "PresentMon не найден. Переустановите "
-                                           "grom или скачайте заново.")
-            return
-        if not is_admin():
-            messagebox.showwarning(
-                APP_NAME, "Для замера FPS нужны права администратора.\n"
-                          "Перезапустите grom от имени администратора.")
-            return
-        label = self.games_proc_menu.get()
-        name = self._games_proc_names.get(label)
-        if not name:
-            messagebox.showwarning(APP_NAME, "Выберите процесс игры из списка.")
-            return
-        self.cfg["games_process"] = label
-        save_config(self.cfg)
-        try:
-            self._pm_proc = subprocess.Popen(
-                [pm, "-process_name", name, "-output_stdout",
-                 "-no_console_stats", "-terminate_on_proc_exit"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                creationflags=CREATE_NO_WINDOW)
-        except Exception as e:
-            self._pm_proc = None
-            messagebox.showerror(APP_NAME, f"Не удалось запустить замер:\n{e}")
-            return
-        self._pm_name = name
-        self._fps_hist.clear()
-        while not self._fps_queue.empty():
-            try:
-                self._fps_queue.get_nowait()
-            except queue.Empty:
-                break
-        threading.Thread(target=self._fps_reader, daemon=True).start()
-        self.games_btn.configure(text="остановить замер", fg_color=RED,
-                                 hover_color="#E1495A")
-        self._log(f"FPS-монитор: замер «{name}» запущен.")
-
-    def _games_stop(self, ended=False):
-        proc, self._pm_proc = self._pm_proc, None
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        if self._pm_name:
-            self._log(f"FPS-монитор: замер «{self._pm_name}» "
-                      f"{'завершён — игра закрыта' if ended else 'остановлен'}.")
-        try:
-            self.games_btn.configure(text="начать замер", fg_color=ACCENT,
-                                     hover_color=ACCENT_HOVER)
-        except Exception:
-            pass
-
-    def _fps_reader(self):
-        """Читает CSV PresentMon в отдельном потоке, кладёт фреймтаймы в очередь."""
-        proc = self._pm_proc
-        if not proc or not proc.stdout:
-            return
-        idx = None
-        for raw in proc.stdout:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith("Application,"):
-                try:
-                    idx = next(csv.reader([line])).index("MsBetweenPresents")
-                except (ValueError, StopIteration):
-                    idx = None
-                continue
-            if idx is None:
-                continue
-            parts = line.split(",")
-            if len(parts) <= idx:
-                continue
-            try:
-                ft = float(parts[idx])
-            except ValueError:
-                continue
-            if 0.0 < ft < 5000.0:
-                self._fps_queue.put(ft)
-        # поток закончил читать — процесс умер (закрылась игра или замер)
-        if self._pm_proc is proc:
-            try:
-                self.after(0, self._games_stop, True)
-            except Exception:
-                pass
-
-    def _fps_poll(self):
-        try:
-            while True:
-                self._fps_hist.append(self._fps_queue.get_nowait())
-        except queue.Empty:
-            pass
-        try:
-            if self._fps_hist:
-                self._update_fps_labels()
-                self._draw_fps_graph()
-        except Exception:
-            pass
-        self.after(250, self._fps_poll)
-
-    def _update_fps_labels(self):
-        data = list(self._fps_hist)
-        ft = data[-1]
-        cur = 1000.0 / ft
-        avg = sum(1000.0 / x for x in data) / len(data)
-        low = None
-        if len(data) >= 40:
-            slow = sorted(data, reverse=True)[: max(1, len(data) // 100)]
-            low = 1000.0 / (sum(slow) / len(slow))
-        color = GREEN if ft <= 17.5 else (AMBER if ft <= 34 else RED)
-        self.fps_value.configure(text=f"{cur:.0f}", text_color=color)
-        self.fps_avg.configure(text=f"средний: {avg:.0f} FPS")
-        self.fps_low.configure(text=(f"1% low: {low:.0f} FPS" if low
-                                     else "1% low: —"))
-        self.fps_ms.configure(text=f"фреймтайм: {ft:.1f} мс")
-
-    def _draw_fps_graph(self):
-        cv = self.fps_canvas
-        w, h = cv.winfo_width(), cv.winfo_height()
-        if w < 60 or h < 30:
-            return
-        cv.delete("all")
-        data = list(self._fps_hist)
-        n = min(len(data), max(60, w // 3))
-        data = data[-n:]
-        ymax = max(40.0, max(data) * 1.12)
-        top, bottom = 10, h - 6
-        for ms, txt in ((16.7, "60 fps"), (33.3, "30 fps")):
-            if ms < ymax:
-                y = bottom - (ms / ymax) * (bottom - top)
-                cv.create_line(0, y, w, y, fill="#202636", dash=(3, 4))
-                cv.create_text(8, y - 7, text=txt, fill=MUTED, anchor="w",
-                               font=("Segoe UI", 9))
-        if len(data) >= 2:
-            step = w / max(1, len(data) - 1)
-            pts = []
-            for i, v in enumerate(data):
-                y = bottom - (min(v, ymax) / ymax) * (bottom - top)
-                pts += [i * step, y]
-            cv.create_line(*pts, fill=ACCENT, width=2, smooth=True)
-        cv.create_text(w - 10, 12, text=f"{data[-1]:.1f} мс",
-                       fill=MUTED, anchor="e", font=("Segoe UI", 10))
 
     # ---- загрузка железа (фоновый поток + обновление виджетов)
 
@@ -1595,6 +1329,412 @@ class App(ctk.CTk):
         except Exception:
             pass
         self.after(1000, self._hw_update)
+
+    # ---------------------------------------------------------------- VPN
+
+    def _build_vpn(self):
+        p = self.pages["vpn"]
+        head = ctk.CTkFrame(p, fg_color="transparent")
+        head.pack(fill="x")
+        ctk.CTkLabel(head, text="VPN", font=ctk.CTkFont(size=25, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        self.vpn_pill = ctk.CTkFrame(head, fg_color=CARD_HOVER, corner_radius=30,
+                                     border_width=1, border_color=BORDER)
+        self.vpn_pill.pack(side="right")
+        self.vpn_status_dot = ctk.CTkLabel(self.vpn_pill, text="●",
+                                           text_color=MUTED,
+                                           font=ctk.CTkFont(size=10))
+        self.vpn_status_dot.pack(side="left", padx=(12, 4), pady=5)
+        self.vpn_status_text = ctk.CTkLabel(self.vpn_pill, text="не подключён",
+                                            text_color=MUTED,
+                                            font=ctk.CTkFont(size=12,
+                                                             weight="bold"))
+        self.vpn_status_text.pack(side="left", padx=(0, 12), pady=5)
+
+        # ---- подписка
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS,
+                            border_width=1, border_color=BORDER)
+        card.pack(fill="x", pady=(18, 0))
+        ctk.CTkLabel(card, text="П О Д П И С К А", font=ctk.CTkFont(
+            size=10, weight="bold"), text_color=MUTED).pack(
+            anchor="w", padx=22, pady=(16, 8))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=22)
+        self.vpn_sub_entry = ctk.CTkEntry(
+            row, height=36, corner_radius=9, border_color=BORDER,
+            fg_color=CONSOLE_BG, text_color=TEXT,
+            placeholder_text="ссылка подписки (ключ от вашего VPN-сервиса)")
+        self.vpn_sub_entry.pack(side="left", fill="x", expand=True)
+        if self._vpn_sub_url:
+            self.vpn_sub_entry.insert(0, self._vpn_sub_url)
+        self.vpn_fetch_btn = ctk.CTkButton(
+            row, text="обновить серверы", width=150, height=36, corner_radius=9,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._vpn_fetch)
+        self.vpn_fetch_btn.pack(side="left", padx=(10, 0))
+        self.vpn_sub_hint = ctk.CTkLabel(card, font=ctk.CTkFont(size=11),
+                                         text_color=MUTED, justify="left",
+                                         anchor="w")
+        self.vpn_sub_hint.pack(fill="x", padx=22, pady=(8, 16))
+        self._vpn_update_hint()
+
+        # ---- серверы
+        card2 = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS,
+                             border_width=1, border_color=BORDER)
+        card2.pack(fill="both", expand=True, pady=(14, 0))
+        hrow = ctk.CTkFrame(card2, fg_color="transparent")
+        hrow.pack(fill="x", padx=22, pady=(16, 6))
+        ctk.CTkLabel(hrow, text="С Е Р В Е Р Ы", font=ctk.CTkFont(
+            size=10, weight="bold"), text_color=MUTED).pack(side="left")
+        self.vpn_ping_btn = ctk.CTkButton(
+            hrow, text="проверить пинг", width=130, height=28, corner_radius=8,
+            fg_color="transparent", hover_color=CARD_HOVER, border_width=1,
+            border_color=BORDER, text_color=MUTED, font=ctk.CTkFont(size=11),
+            command=self._vpn_ping_all)
+        self.vpn_ping_btn.pack(side="right")
+        self.vpn_count_label = ctk.CTkLabel(hrow, text="серверов: —",
+                                            font=ctk.CTkFont(size=11),
+                                            text_color=MUTED)
+        self.vpn_count_label.pack(side="right", padx=(0, 12))
+        self.vpn_list = ctk.CTkScrollableFrame(
+            card2, fg_color="transparent", corner_radius=10)
+        self.vpn_list.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        # ---- подключение
+        foot = ctk.CTkFrame(p, fg_color="transparent")
+        foot.pack(fill="x", pady=(14, 0))
+        self.vpn_sel_label = ctk.CTkLabel(foot, text="сервер не выбран",
+                                          font=ctk.CTkFont(size=13),
+                                          text_color=MUTED, anchor="w")
+        self.vpn_sel_label.pack(side="left")
+        self.vpn_btn = ctk.CTkButton(
+            foot, text="подключить", width=190, height=42, corner_radius=11,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._vpn_toggle)
+        self.vpn_btn.pack(side="right")
+
+        self._vpn_render_list()
+        self._vpn_update_sel_label()
+
+    # ---- обновление подписки
+
+    def _vpn_update_hint(self):
+        try:
+            if self._vpn_updated and self._vpn_servers:
+                t = self._vpn_updated.strftime("%H:%M")
+                self.vpn_sub_hint.configure(
+                    text=f"последнее обновление: {t} · серверов: "
+                         f"{len(self._vpn_servers)}")
+            elif self._vpn_sub_url:
+                self.vpn_sub_hint.configure(
+                    text="ссылка сохранена — нажмите «обновить серверы», "
+                         "чтобы получить список")
+            else:
+                self.vpn_sub_hint.configure(
+                    text="Вставьте ссылку подписки из вашего VPN-сервиса "
+                         "(как в happ) и нажмите «обновить серверы».\n"
+                         "Поддерживается vless, vmess, trojan, ss, "
+                         "hysteria2 и tuic.")
+        except Exception:
+            pass
+
+    def _vpn_fetch(self):
+        if self._vpn_busy:
+            return
+        url = self.vpn_sub_entry.get().strip()
+        if not url or "://" not in url:
+            messagebox.showwarning(APP_NAME, "Вставьте ссылку подписки — "
+                                             "она начинается с http:// или "
+                                             "другой схемой.")
+            return
+        self._vpn_busy = True
+        self.vpn_fetch_btn.configure(state="disabled", text="загрузка…")
+        self._log("VPN: скачиваю подписку…")
+        ua = str((self.cfg.get("vpn") or {}).get("ua") or "") or None
+        threading.Thread(target=self._vpn_fetch_worker,
+                         args=(url, ua), daemon=True).start()
+
+    def _vpn_fetch_worker(self, url, ua):
+        err = None
+        servers = []
+        try:
+            text = vpn_core.fetch_subscription(url, ua=ua) if ua \
+                else vpn_core.fetch_subscription(url)
+            links = vpn_core.decode_subscription(text)
+            servers = vpn_core.parse_links(links)
+            if not links:
+                err = "в подписке не найдено ни одной ссылки сервера"
+            elif not servers:
+                err = "ссылки есть, но разобрать их не удалось"
+        except Exception as e:
+            err = str(e) or type(e).__name__
+        try:
+            self.after(0, self._vpn_fetch_done, url, servers, err)
+        except Exception:
+            pass
+
+    def _vpn_fetch_done(self, url, servers, err):
+        self._vpn_busy = False
+        try:
+            self.vpn_fetch_btn.configure(state="normal", text="обновить серверы")
+        except tk.TclError:
+            return
+        if err:
+            self._log(f"VPN: не получилось — {err}")
+            messagebox.showerror(APP_NAME, f"Не удалось получить серверы:\n{err}")
+            return
+        self._vpn_sub_url = url
+        self._vpn_servers = servers
+        self._vpn_pings = {}
+        self._vpn_updated = time.localtime()
+        self.cfg["vpn"] = dict(self.cfg.get("vpn") or {},
+                               sub_url=url, selected_link=self._vpn_sel_link)
+        save_config(self.cfg)
+        # сохранённый выбор мог исчезнуть из подписки
+        if self._vpn_sel_link not in {s["link"] for s in servers}:
+            self._vpn_sel_link = ""
+        self._vpn_render_list()
+        self._vpn_update_sel_label()
+        self._vpn_update_hint()
+        self._log(f"VPN: подписка обновлена — серверов: {len(servers)}.")
+        self._vpn_ping_all()
+
+    # ---- список серверов
+
+    def _vpn_render_list(self):
+        for w in self.vpn_list.winfo_children():
+            w.destroy()
+        self._vpn_rows = []
+        self.vpn_count_label.configure(
+            text=f"серверов: {len(self._vpn_servers)}" if self._vpn_servers
+            else "серверов: —")
+        for i, rec in enumerate(self._vpn_servers):
+            sel = rec["link"] == self._vpn_sel_link
+            fr = ctk.CTkFrame(self.vpn_list, height=44, corner_radius=10,
+                              fg_color=ACTIVE_BG if sel else "transparent",
+                              border_width=1 if sel else 0,
+                              border_color=ACCENT)
+            fr.pack(fill="x", pady=2, padx=4)
+            fr.pack_propagate(False)
+            dot = ctk.CTkLabel(fr, text="●", font=ctk.CTkFont(size=9),
+                               text_color=ACCENT if sel else MUTED)
+            dot.pack(side="left", padx=(14, 8))
+            name = rec["name"][:60]
+            ctk.CTkLabel(fr, text=name, font=ctk.CTkFont(
+                size=13, weight="bold" if sel else "normal"),
+                text_color=TEXT if sel else "#C4C9D6", anchor="w").pack(
+                side="left")
+            ctk.CTkLabel(fr, text=rec["type"], font=ctk.CTkFont(size=10),
+                         text_color=MUTED).pack(side="left", padx=(10, 0))
+            ping = ctk.CTkLabel(fr, text="—", width=100, anchor="e",
+                                font=ctk.CTkFont(size=12),
+                                text_color=MUTED)
+            ping.pack(side="right", padx=(0, 14))
+            for w in (fr, dot, ping):
+                w.bind("<Button-1>", lambda e, k=i: self._vpn_select(k))
+            self._vpn_rows.append((fr, dot, ping, rec))
+            if rec["link"] in self._vpn_pings:
+                self._vpn_paint_ping(ping, self._vpn_pings[rec["link"]])
+
+    def _vpn_select(self, idx):
+        if not (0 <= idx < len(self._vpn_servers)):
+            return
+        self._vpn_sel_link = self._vpn_servers[idx]["link"]
+        self.cfg["vpn"] = dict(self.cfg.get("vpn") or {},
+                               sub_url=self._vpn_sub_url,
+                               selected_link=self._vpn_sel_link)
+        save_config(self.cfg)
+        for i, (fr, dot, ping, rec) in enumerate(self._vpn_rows):
+            sel = i == idx
+            try:
+                fr.configure(fg_color=ACTIVE_BG if sel else "transparent",
+                             border_width=1 if sel else 0)
+                dot.configure(text_color=ACCENT if sel else MUTED)
+            except tk.TclError:
+                pass
+        self._vpn_update_sel_label()
+
+    def _vpn_update_sel_label(self):
+        rec = self._vpn_selected()
+        text = (f"выбран: {rec['name'][:50]}  ({rec['host']}:{rec['port']})"
+                if rec else "сервер не выбран")
+        try:
+            self.vpn_sel_label.configure(text=text)
+        except tk.TclError:
+            pass
+
+    def _vpn_selected(self):
+        for rec in self._vpn_servers:
+            if rec["link"] == self._vpn_sel_link:
+                return rec
+        return None
+
+    # ---- пинг
+
+    def _vpn_ping_all(self):
+        if self._vpn_busy or not self._vpn_servers:
+            return
+        self._vpn_busy = True
+        self.vpn_ping_btn.configure(state="disabled", text="замер…")
+        servers = list(self._vpn_servers)
+        threading.Thread(target=self._vpn_ping_worker,
+                         args=(servers,), daemon=True).start()
+
+    def _vpn_ping_worker(self, servers):
+        from concurrent.futures import ThreadPoolExecutor
+        results = {}
+
+        def one(rec):
+            return rec["link"], vpn_core.tcp_ping(rec["host"], rec["port"])
+
+        with ThreadPoolExecutor(max_workers=24) as pool:
+            for link, ms in pool.map(one, servers):
+                results[link] = ms
+        try:
+            self.after(0, self._vpn_ping_done, results)
+        except Exception:
+            pass
+
+    def _vpn_ping_done(self, results):
+        self._vpn_busy = False
+        try:
+            self.vpn_ping_btn.configure(state="normal", text="проверить пинг")
+        except tk.TclError:
+            return
+        self._vpn_pings = results
+        for fr, dot, ping, rec in self._vpn_rows:
+            self._vpn_paint_ping(ping, results.get(rec["link"]))
+        ok = sum(1 for v in results.values() if v is not None)
+        self._log(f"VPN: пинг проверен — доступно {ok} из {len(results)}.")
+
+    @staticmethod
+    def _vpn_paint_ping(label, ms):
+        try:
+            if ms is None:
+                label.configure(text="недоступен", text_color=RED)
+            else:
+                label.configure(
+                    text=f"{ms:.0f} мс",
+                    text_color=GREEN if ms <= 150 else (AMBER if ms <= 350
+                                                        else RED))
+        except tk.TclError:
+            pass
+
+    # ---- подключение
+
+    def _vpn_toggle(self):
+        if self._vpn_proc:
+            self._vpn_disconnect()
+        else:
+            self._vpn_connect()
+
+    def _vpn_connect(self):
+        rec = self._vpn_selected()
+        if not rec:
+            messagebox.showwarning(APP_NAME, "Сначала выберите сервер "
+                                             "в списке (клик по строке).")
+            return
+        exe = vpn_core.ensure_core(VERSION)
+        if not exe:
+            messagebox.showerror(APP_NAME, "Ядро VPN не найдено. Переустановите "
+                                           "grom или скачайте заново.")
+            return
+        self._vpn_busy = True
+        self.vpn_btn.configure(state="disabled", text="подключение…")
+        self._log(f"VPN: подключаюсь к «{rec['name'][:40]}»…")
+        threading.Thread(target=self._vpn_connect_worker,
+                         args=(exe, rec), daemon=True).start()
+
+    def _vpn_connect_worker(self, exe, rec):
+        ok, err, port, proc = False, None, None, None
+        try:
+            os.makedirs(vpn_core.VPN_DIR, exist_ok=True)
+            port = vpn_core.find_free_port()
+            log_path = os.path.join(vpn_core.VPN_DIR, "sing-box.log")
+            cfg_path = os.path.join(vpn_core.VPN_DIR, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(vpn_core.make_config(rec["ob"], port, log_path),
+                          f, ensure_ascii=False, indent=2)
+            proc = vpn_core.launch_core(exe, cfg_path)
+            time.sleep(1.4)
+            if proc.poll() is not None:
+                proc = None
+                err = vpn_core.tail_file(log_path) or "sing-box не запустился"
+            else:
+                ok = True
+        except Exception as e:
+            err = str(e) or type(e).__name__
+        try:
+            self.after(0, self._vpn_connect_done, ok, err, port, rec, proc)
+        except Exception:
+            pass
+
+    def _vpn_connect_done(self, ok, err, port, rec, proc=None):
+        self._vpn_busy = False
+        try:
+            self.vpn_btn.configure(state="normal")
+        except tk.TclError:
+            return
+        if not ok:
+            self.vpn_btn.configure(text="подключить")
+            self._log(f"VPN: ошибка запуска — {err}")
+            messagebox.showerror(APP_NAME,
+                                 f"Сервер не запустился:\n{err}")
+            return
+        # поднять системный прокси
+        try:
+            self._vpn_proxy_state = vpn_core.save_proxy_state()
+            vpn_core.set_system_proxy(True, f"127.0.0.1:{port}")
+        except Exception as e:
+            self._log(f"VPN: прокси не настроился ({e}) — туннель работает, "
+                      f"но программы сами должны использовать "
+                      f"127.0.0.1:{port}")
+        self._vpn_proc = proc
+        self._vpn_port = port
+        self._vpn_apply_connected_ui()
+        self._log(f"VPN: подключено к «{rec['name'][:40]}» "
+                  f"({rec['host']}:{rec['port']}), прокси 127.0.0.1:{port}.")
+
+    def _vpn_apply_connected_ui(self):
+        try:
+            self.vpn_btn.configure(text="отключить", fg_color=RED,
+                                   hover_color="#E1495A", state="normal")
+            self.vpn_status_dot.configure(text_color=GREEN)
+            self.vpn_status_text.configure(text="подключён", text_color=GREEN)
+            self.vpn_pill.configure(fg_color=TINT_GREEN,
+                                    border_color=lerp_color(TINT_GREEN,
+                                                            GREEN, 0.3))
+        except tk.TclError:
+            pass
+
+    def _vpn_disconnect(self, silent=False):
+        proc, self._vpn_proc = self._vpn_proc, None
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if self._vpn_proxy_state is not None:
+            try:
+                vpn_core.restore_proxy_state(self._vpn_proxy_state)
+            except Exception:
+                pass
+            self._vpn_proxy_state = None
+        self._vpn_port = None
+        try:
+            self.vpn_btn.configure(text="подключить", fg_color=ACCENT,
+                                   hover_color=ACCENT_HOVER, state="normal")
+            self.vpn_status_dot.configure(text_color=MUTED)
+            self.vpn_status_text.configure(text="не подключён",
+                                           text_color=MUTED)
+            self.vpn_pill.configure(fg_color=CARD_HOVER,
+                                    border_color=BORDER)
+        except (tk.TclError, AttributeError):
+            pass
+        if not silent and proc:
+            self._log("VPN: отключено, системный прокси возвращён.")
 
     # ---------------------------------------------------------------- тема
 
@@ -1853,6 +1993,8 @@ class App(ctk.CTk):
         if self.strategies:
             if 0 <= (self.selected or 0) < len(self.strategies):
                 self.select_strategy(self.selected or 0)
+        if self._vpn_proc:            # VPN остаётся подключённым при смене темы
+            self._vpn_apply_connected_ui()
         self._shown_running = None   # существующий цикл опроса сам обновит статус
 
     def _walk_widgets(self):
@@ -2164,12 +2306,7 @@ class App(ctk.CTk):
 
     def _on_close(self):
         self._hw_close = True
-        if self._pm_proc:
-            try:
-                self._pm_proc.kill()
-            except Exception:
-                pass
-            self._pm_proc = None
+        self._vpn_disconnect(silent=True)
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
         save_config(self.cfg)
