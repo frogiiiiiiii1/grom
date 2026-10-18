@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""
+grom — обёртка над winws (zapret) для Windows. v1.3
+
+* Тёмный интерфейс, без консольных окон
+* Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
+* Одна круглая кнопка запуска/остановки обхода
+* Внутри встроен дистрибутив zapret — работает и без папки zapret на ПК
+* Автозапуск через планировщик задач
+* Всё в одном exe: pyinstaller --onefile --noconsole zapret_gui.py
+"""
+
+import ctypes
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+
+APP_NAME = "grom"
+VERSION = "1.4"
+AUTOSTART_TASK = "grom"
+CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                           "grom", "config.json")
+LEGACY_TASK = "ZapretGUI"
+# правильный флаг: без него дочерние консольные процессы открывают окно
+CREATE_NO_WINDOW = 0x08000000
+
+# ------------------------------------------------------------------ оформление
+
+BG = "#0A0C10"
+SIDEBAR = "#0E1015"
+CARD = "#151922"
+CARD_HOVER = "#1B202B"
+CONSOLE_BG = "#090B0F"
+ACCENT = "#7C6CFF"
+ACCENT_HOVER = "#6A59F2"
+GREEN = "#2BD576"
+RED = "#FF5D6C"
+AMBER = "#FFB454"
+TEXT = "#ECEDF3"
+MUTED = "#788094"
+BORDER = "#232937"
+TINT_GREEN = "#12271D"
+TINT_RED = "#2A151A"
+TINT_AMBER = "#2A2113"
+# активный пункт меню
+ACTIVE_BG = "#181534"
+ACTIVE_HOVER = "#1D1940"
+ACTIVE_TEXT = "#A99DFF"
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+# ------------------------------------------------------------------ системное
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    params = " ".join(f'"{a}"' for a in sys.argv if a != "--no-elevate")
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    return rc > 32
+
+
+def enable_dark_titlebar(hwnd):
+    """Тёмный заголовок окна на Windows 10/11."""
+    if not hwnd:
+        return
+    try:
+        val = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), 20, ctypes.byref(val), ctypes.sizeof(val))
+    except Exception:
+        pass
+
+
+def decode_console(raw: bytes) -> str:
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def find_winws(zapret_dir: str):
+    for rel in (os.path.join("bin", "winws.exe"),
+                os.path.join("bin", "win64", "winws.exe"),
+                os.path.join("bin", "win32", "winws.exe")):
+        p = os.path.join(zapret_dir, rel)
+        if os.path.isfile(p):
+            return p
+    for root, _dirs, files in os.walk(zapret_dir):
+        for f in files:
+            if f.lower() == "winws.exe":
+                return os.path.join(root, f)
+    return None
+
+
+def detect_zapret_dir(cfg_dir: str = None):
+    candidates = []
+    if cfg_dir:
+        candidates.append(cfg_dir)
+    home = os.path.expanduser("~")
+    for base in (os.path.join(home, "Desktop"), home,
+                 os.path.join(home, "Documents"), os.path.join(home, "Downloads")):
+        for name in ("запрет", "zapret"):
+            candidates.append(os.path.join(base, name))
+    for letter in "CDEFGH":
+        for name in ("запрет", "zapret"):
+            candidates.append(f"{letter}:\\{name}")
+    for c in candidates:
+        if os.path.isdir(c) and find_winws(c):
+            return c
+    return None
+
+# ------------------------------------------------------------------ конфиг
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# ------------------------------------------------------------------ разбор батников
+
+
+RE_CONTINUATION = re.compile(r"\s*\^\s*$")
+RE_START = re.compile(r'^\s*start\s+"[^"]*"\s+(?:/min\s+)?"([^"]*winws\.exe)"\s*(.*)$', re.I)
+RE_QUOTED_EXE = re.compile(r'^\s*"([^"]*winws\.exe)"\s*(.*)$', re.I)
+RE_WINWS_LINE = re.compile(r"^\s*%winws%\s+(.+)$", re.I)
+RE_WINWS_SET = re.compile(r"^\s*set\s+winws\d*=(.+winws\.exe.+)$", re.I)
+RE_MENU = re.compile(r"^\s*echo\s+(\d{1,2})\s*-\s*(.+?)\s*$", re.I)
+
+
+def game_filter_ports(zapret_dir: str):
+    """Порты игрового фильтра — логика service.bat :game_switch_status."""
+    flag = os.path.join(zapret_dir, "utils", "game_filter.enabled")
+    mode = None
+    try:
+        with open(flag, encoding="utf-8", errors="replace") as f:
+            mode = f.readline().strip()
+    except OSError:
+        pass
+    if mode and mode.lower() == "all":
+        return "1024-65535", "1024-65535"
+    if mode and mode.lower() == "tcp":
+        return "1024-65535", "12"
+    if mode:
+        return "12", "1024-65535"
+    return "12", "12"
+
+
+def resolve_vars(args: str, zapret_dir: str):
+    gtcp, gudp = game_filter_ports(zapret_dir)
+    bin_dir = os.path.join(zapret_dir, "bin") + "\\"
+    lists_dir = os.path.join(zapret_dir, "lists") + "\\"
+    subs = {
+        "bin": bin_dir, "lists": lists_dir,
+        "gamefiltertcp": gtcp, "gamefilterudp": gudp,
+        "bin_path": bin_dir, "lists_path": lists_dir,
+        "~dp0": zapret_dir + "\\",
+    }
+
+    def repl(m):
+        return subs.get(m.group(1).lower(), m.group(0))
+
+    return re.sub(r"%([^%]+)%", repl, args)
+
+
+def parse_bat_file(path: str, zapret_dir: str):
+    try:
+        text = open(path, "rb").read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+
+    logical, pending = [], ""
+    for line in text.splitlines():
+        pending = (pending + " " + line.strip()) if pending else line
+        if RE_CONTINUATION.search(pending):
+            pending = RE_CONTINUATION.sub("", pending)
+            continue
+        logical.append(pending)
+        pending = ""
+    if pending:
+        logical.append(pending)
+
+    strategies = []
+    for line in logical:
+        m = RE_START.match(line) or RE_QUOTED_EXE.match(line)
+        if m and m.group(2).strip():
+            strategies.append(("", resolve_vars(m.group(2).strip(), zapret_dir)))
+    if strategies:
+        return strategies
+
+    menu, args_list = {}, []
+    for line in logical:
+        m = RE_MENU.match(line)
+        if m:
+            menu[int(m.group(1))] = m.group(2)
+            continue
+        m = RE_WINWS_LINE.match(line)
+        if m:
+            args_list.append(m.group(1).strip())
+            continue
+        m = RE_WINWS_SET.match(line)
+        if m:
+            val = m.group(1).strip()
+            idx = val.lower().find("winws.exe")
+            rest = val[idx + len("winws.exe"):].strip().strip('"')
+            if rest:
+                args_list.append(rest)
+    for i, args in enumerate(args_list):
+        strategies.append((menu.get(i, ""), resolve_vars(args, zapret_dir)))
+    return strategies
+
+
+SKIP_BATS = ("service.bat",)
+
+
+def scan_strategies(zapret_dir: str):
+    result = []
+    try:
+        bats = sorted(f for f in os.listdir(zapret_dir) if f.lower().endswith(".bat"))
+    except OSError:
+        bats = []
+    for bat in bats:
+        if bat.lower() in SKIP_BATS:
+            continue
+        strats = parse_bat_file(os.path.join(zapret_dir, bat), zapret_dir)
+        stem = bat[:-4]
+        for i, (menu_name, args) in enumerate(strats):
+            name = menu_name or (stem if len(strats) == 1 else f"{stem} #{i + 1}")
+            result.append((bat, name, args))
+    return result
+
+# --------------------------------------------- уборка артефактов сервисов (v1.2)
+
+MARK_BEGIN = "# >>> Zapret GUI >>>"
+MARK_END = "# <<< Zapret GUI <<<"
+
+
+def remove_service_artifacts(zapret_dir: str):
+    """Удалить ранее дописанные домены Telegram/Roblox из списков обхода."""
+    if not zapret_dir:
+        return
+    lists_dir = os.path.join(zapret_dir, "lists")
+    user_list = os.path.join(lists_dir, "list-general-user.txt")
+    try:
+        with open(user_list, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    cleaned, skip, changed = [], False, False
+    for ln in lines:
+        if ln.strip() == MARK_BEGIN:
+            skip, changed = True, True
+            continue
+        if ln.strip() == MARK_END:
+            skip, changed = False, True
+            continue
+        if not skip:
+            cleaned.append(ln)
+    if changed:
+        try:
+            with open(user_list, "w", encoding="utf-8") as f:
+                f.write("\n".join(cleaned).rstrip() + "\n")
+        except OSError:
+            pass
+    ipset = os.path.join(lists_dir, "ipset-telegram.txt")
+    try:
+        if os.path.isfile(ipset):
+            os.remove(ipset)
+    except OSError:
+        pass
+
+# ------------------------------------------------------------------ автозапуск
+
+
+def autostart_cmd():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --autorun'
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.isfile(pythonw):
+        return f'"{pythonw}" "{os.path.abspath(__file__)}" --autorun'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}" --autorun'
+
+
+def autostart_state():
+    rc = subprocess.run(["schtasks", "/Query", "/TN", AUTOSTART_TASK],
+                        capture_output=True, creationflags=CREATE_NO_WINDOW)
+    return rc.returncode == 0
+
+
+def autostart_set(enabled: bool, cmd_line: str = None):
+    if enabled:
+        subprocess.run(
+            ["schtasks", "/Create", "/F", "/TN", AUTOSTART_TASK,
+             "/TR", cmd_line or autostart_cmd(), "/SC", "ONLOGON", "/RL", "HIGHEST"],
+            capture_output=True, creationflags=CREATE_NO_WINDOW, check=True)
+    else:
+        subprocess.run(["schtasks", "/Delete", "/F", "/TN", AUTOSTART_TASK],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
+
+
+def winws_already_running():
+    rc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq winws.exe"],
+                        capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+    return "winws.exe" in (rc.stdout or "").lower()
+
+
+def kill_foreign_winws():
+    """Остановить чужие процессы winws (чтобы не было двух копий с пересечением фильтров)."""
+    subprocess.run(["taskkill", "/IM", "winws.exe", "/F"],
+                   capture_output=True, creationflags=CREATE_NO_WINDOW)
+
+
+def cleanup_legacy():
+    """Убрать артефакты старых версий (Zapret GUI): задачу планировщика."""
+    subprocess.run(["schtasks", "/Delete", "/F", "/TN", LEGACY_TASK],
+                   capture_output=True, creationflags=CREATE_NO_WINDOW)
+
+# ------------------------------------------------------ встроенная копия zapret
+
+
+def _local_data_dir():
+    base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+            or os.path.expanduser("~"))
+    return os.path.join(base, "grom")
+
+
+EMBEDDED_DIR = os.path.join(_local_data_dir(), "zapret")
+BUNDLE_DIR = os.path.join(getattr(sys, "_MEIPASS",
+                                  os.path.dirname(os.path.abspath(__file__))),
+                          "zapret_bundle")
+ICON_PATH = os.path.join(getattr(sys, "_MEIPASS",
+                                 os.path.dirname(os.path.abspath(__file__))),
+                         "grom_icon.ico")
+
+
+def ensure_embedded_zapret():
+    """Распаковать встроенную копию zapret в %LOCALAPPDATA%\\grom\\zapret.
+
+    При обновлении версии grom копия распаковывается заново.
+    Возвращает папку или None, если встроенной копии нет.
+    """
+    marker = os.path.join(EMBEDDED_DIR, "grom-version.txt")
+    if find_winws(EMBEDDED_DIR) and os.path.isfile(marker):
+        try:
+            with open(marker, encoding="utf-8") as f:
+                if f.read().strip() == VERSION:
+                    return EMBEDDED_DIR
+        except OSError:
+            pass
+    if not os.path.isdir(BUNDLE_DIR):
+        return find_winws(EMBEDDED_DIR) and EMBEDDED_DIR
+    shutil.rmtree(EMBEDDED_DIR, ignore_errors=True)
+    try:
+        shutil.copytree(BUNDLE_DIR, EMBEDDED_DIR)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(VERSION)
+    except OSError:
+        pass
+    return find_winws(EMBEDDED_DIR) and EMBEDDED_DIR
+
+# ------------------------------------------------------------------ приложение
+
+
+class App(ctk.CTk):
+    def __init__(self, autorun: bool = False):
+        super().__init__()
+        self.proc = None
+        self.strategies = []          # [{source, name, args}]
+        self.selected = None
+        self.cfg = load_config()
+        self.cfg.pop("services", None)
+
+        self.title(f"{APP_NAME} · v{VERSION}")
+        self.geometry("1020x720")
+        self.minsize(940, 640)
+        self.configure(fg_color=BG)
+        try:
+            if os.path.isfile(ICON_PATH):
+                self.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+        self.zapret_dir = detect_zapret_dir(self.cfg.get("zapret_dir"))
+        if not self.zapret_dir:
+            self.zapret_dir = ensure_embedded_zapret()
+        self.winws_exe = find_winws(self.zapret_dir) if self.zapret_dir else None
+        cleanup_legacy()
+        remove_service_artifacts(self.zapret_dir)
+
+        self._build_sidebar()
+        self._build_pages()
+        self.show_page("home")
+
+        self._reload_strategies()
+        self._poll_process()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.after(150, self._apply_dark_titlebar)
+
+        if not is_admin() and not autorun:
+            self.after(400, self._ask_elevation)
+        if autorun:
+            self.after(900, self._autorun_start)
+
+    def _apply_dark_titlebar(self):
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            enable_dark_titlebar(hwnd)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- сайдбар
+
+    def _build_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=244, fg_color=SIDEBAR, corner_radius=0)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+
+        # ---- логотип
+        logo = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        logo.pack(fill="x", padx=22, pady=(30, 0))
+        badge = ctk.CTkFrame(logo, width=46, height=46, fg_color=ACCENT,
+                             corner_radius=14)
+        badge.pack(side="left")
+        badge.pack_propagate(False)
+        self._logo_image = None
+        try:
+            if os.path.isfile(ICON_PATH):
+                from PIL import Image
+                src = Image.open(ICON_PATH).convert("RGBA").resize(
+                    (32, 32), Image.LANCZOS)
+                self._logo_image = ctk.CTkImage(light_image=src, dark_image=src,
+                                                size=(32, 32))
+        except Exception:
+            pass
+        if self._logo_image:
+            ctk.CTkLabel(badge, image=self._logo_image, text="").pack(expand=True)
+        else:
+            ctk.CTkLabel(badge, text="⚡", font=ctk.CTkFont(size=21),
+                         text_color="#FFFFFF").pack(expand=True)
+        names = ctk.CTkFrame(logo, fg_color="transparent")
+        names.pack(side="left", padx=(12, 0))
+        ctk.CTkLabel(names, text="grom", font=ctk.CTkFont(size=22, weight="bold"),
+                     text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(names, text=f"обход DPI · v{VERSION}",
+                     font=ctk.CTkFont(size=10), text_color=MUTED).pack(anchor="w")
+
+        # ---- разделитель и заголовок раздела
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=BORDER).pack(
+            fill="x", padx=20, pady=(22, 16))
+        ctk.CTkLabel(self.sidebar, text="М Е Н Ю", font=ctk.CTkFont(
+            size=10, weight="bold"), text_color="#4A5165").pack(
+            anchor="w", padx=28, pady=(0, 10))
+
+        # ---- пункты навигации с индикатором активного раздела
+        self.nav_buttons = {}
+        self.nav_indicators = {}
+        for key, label, icon in (("home", "Главная", "⌂"),
+                                 ("autostart", "Автозапуск", "↻"),
+                                 ("about", "О программе", "ⓘ")):
+            wrap = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+            wrap.pack(fill="x", padx=14, pady=3)
+            ind = ctk.CTkFrame(wrap, width=4, height=24, corner_radius=2,
+                               fg_color="transparent")
+            ind.pack(side="left", padx=(5, 11))
+            b = ctk.CTkButton(wrap, text=f"{icon}    {label}", anchor="w",
+                              height=44, corner_radius=12,
+                              fg_color="transparent", hover_color=CARD_HOVER,
+                              text_color=MUTED, font=ctk.CTkFont(size=13),
+                              command=lambda k=key: self.show_page(k))
+            b.pack(fill="x", expand=True)
+            self.nav_indicators[key] = ind
+            self.nav_buttons[key] = b
+
+        # ---- карточка статуса внизу
+        bottom = ctk.CTkFrame(self.sidebar, fg_color=CARD, corner_radius=14,
+                              border_width=1, border_color=BORDER)
+        bottom.pack(side="bottom", fill="x", padx=16, pady=18)
+        row = ctk.CTkFrame(bottom, fg_color="transparent")
+        row.pack(fill="x", padx=15, pady=(14, 0))
+        self.side_status_dot = ctk.CTkLabel(row, text="●", text_color=MUTED,
+                                            font=ctk.CTkFont(size=10))
+        self.side_status_dot.pack(side="left")
+        self.side_status_text = ctk.CTkLabel(row, text="winws не запущен",
+                                             text_color=MUTED,
+                                             font=ctk.CTkFont(size=12))
+        self.side_status_text.pack(side="left", padx=(8, 0))
+        ctk.CTkFrame(bottom, height=1, fg_color=BORDER).pack(
+            fill="x", padx=15, pady=11)
+        self.admin_label = ctk.CTkLabel(
+            bottom,
+            text="✓ права администратора" if is_admin() else "⚠ нужны права админа",
+            text_color=GREEN if is_admin() else AMBER,
+            font=ctk.CTkFont(size=11, weight="bold"))
+        self.admin_label.pack(anchor="w", padx=15, pady=(0, 14))
+
+    # ---------------------------------------------------------------- страницы
+
+    def _build_pages(self):
+        self.pages = {}
+        self.content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self.content.pack(side="left", fill="both", expand=True)
+        for key in ("home", "autostart", "about"):
+            self.pages[key] = ctk.CTkFrame(self.content, fg_color=BG, corner_radius=0)
+        self._build_home()
+        self._build_autostart()
+        self._build_about()
+
+    def show_page(self, key):
+        for k, page in self.pages.items():
+            page.pack_forget()
+            btn = self.nav_buttons[k]
+            ind = self.nav_indicators[k]
+            if k == key:
+                ind.configure(fg_color=ACCENT)
+                btn.configure(fg_color=ACTIVE_BG, hover_color=ACTIVE_BG,
+                              text_color=ACTIVE_TEXT,
+                              font=ctk.CTkFont(size=13, weight="bold"))
+            else:
+                ind.configure(fg_color="transparent")
+                btn.configure(fg_color="transparent", hover_color=CARD_HOVER,
+                              text_color=MUTED, font=ctk.CTkFont(size=13))
+        self.pages[key].pack(fill="both", expand=True, padx=30, pady=26)
+
+    # ---------------------------------------------------------------- главная
+
+    def _build_home(self):
+        p = self.pages["home"]
+        head = ctk.CTkFrame(p, fg_color="transparent")
+        head.pack(fill="x")
+        ctk.CTkLabel(head, text="Главная", font=ctk.CTkFont(size=25, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        self.status_pill = ctk.CTkFrame(head, fg_color=TINT_AMBER, corner_radius=30,
+                                        border_width=1, border_color="#3D3418")
+        self.status_pill.pack(side="right")
+        self.status_dot = ctk.CTkLabel(self.status_pill, text="●", text_color=AMBER,
+                                       font=ctk.CTkFont(size=10))
+        self.status_dot.pack(side="left", padx=(12, 4), pady=5)
+        self.status_text = ctk.CTkLabel(self.status_pill, text="не запущен",
+                                        text_color=AMBER,
+                                        font=ctk.CTkFont(size=12, weight="bold"))
+        self.status_text.pack(side="left", padx=(0, 12), pady=5)
+
+        # ---- hero-карточка
+        hero = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+                            border_color=BORDER)
+        hero.pack(fill="x", pady=(20, 0))
+
+        row1 = ctk.CTkFrame(hero, fg_color="transparent")
+        row1.pack(fill="x", padx=24, pady=(22, 0))
+        icon = ctk.CTkFrame(row1, width=52, height=52, fg_color=ACCENT,
+                            corner_radius=13)
+        icon.pack(side="left")
+        icon.pack_propagate(False)
+        ctk.CTkLabel(icon, text="⚡", font=ctk.CTkFont(size=22),
+                     text_color="#FFFFFF").pack(expand=True)
+        meta = ctk.CTkFrame(row1, fg_color="transparent")
+        meta.pack(side="left", padx=(14, 0))
+        ctk.CTkLabel(meta, text="СТРАТЕГИЯ ОБХОДА", font=ctk.CTkFont(
+            size=10, weight="bold"), text_color=MUTED).pack(anchor="w")
+        self.hero_name = ctk.CTkLabel(meta, text="— не выбрана —",
+                                      font=ctk.CTkFont(size=17, weight="bold"),
+                                      text_color=TEXT, anchor="w")
+        self.hero_name.pack(anchor="w")
+        self.hero_source = ctk.CTkLabel(meta, text="", font=ctk.CTkFont(size=11),
+                                        text_color=MUTED, anchor="w")
+        self.hero_source.pack(anchor="w")
+        self.btn_settings = ctk.CTkButton(
+            row1, text="⚙", width=44, height=44, corner_radius=11,
+            fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+            border_color=BORDER, text_color=TEXT, font=ctk.CTkFont(size=17),
+            command=self._open_strategy_editor)
+        self.btn_settings.pack(side="right")
+
+        # ---- круглая кнопка запуска/остановки
+        ctrl = ctk.CTkFrame(hero, fg_color="transparent", height=172)
+        ctrl.pack(fill="x", pady=(24, 0))
+        ctrl.pack_propagate(False)
+        self.power_glow = ctk.CTkFrame(ctrl, width=136, height=136,
+                                       corner_radius=68, fg_color="#141233")
+        self.power_glow.place(relx=0.5, y=76, anchor="center")
+        self.btn_power = ctk.CTkButton(
+            ctrl, text="▶", width=114, height=114, corner_radius=57,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, border_width=0,
+            text_color="#FFFFFF", font=ctk.CTkFont(size=42),
+            command=self._toggle_power)
+        self.btn_power.place(relx=0.5, y=76, anchor="center")
+        self.power_caption = ctk.CTkLabel(
+            ctrl, text="запустить обход", font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=MUTED)
+        self.power_caption.place(relx=0.5, y=150, anchor="n")
+        ctk.CTkFrame(hero, height=18, fg_color="transparent").pack()
+
+        # ---- папка
+        dirbar = ctk.CTkFrame(p, fg_color="transparent")
+        dirbar.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(dirbar, text="Папка zapret:", text_color=MUTED,
+                     font=ctk.CTkFont(size=12)).pack(side="left")
+        self.dir_entry = ctk.CTkEntry(dirbar, height=34, corner_radius=9,
+                                      border_color=BORDER, fg_color=CARD,
+                                      text_color=TEXT)
+        self.dir_entry.pack(side="left", fill="x", expand=True, padx=10)
+        if self.zapret_dir:
+            self.dir_entry.insert(0, self.zapret_dir)
+        ctk.CTkButton(dirbar, text="Обзор…", width=92, height=34, corner_radius=9,
+                      fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+                      border_color=BORDER, text_color=TEXT,
+                      command=self._choose_dir).pack(side="left")
+        ctk.CTkButton(dirbar, text="Применить", width=104, height=34, corner_radius=9,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=self._apply_dir).pack(side="left", padx=(6, 0))
+
+        # ---- лог
+        log_card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+                                border_color=BORDER)
+        log_card.pack(fill="both", expand=True, pady=(14, 0))
+        head2 = ctk.CTkFrame(log_card, fg_color="transparent")
+        head2.pack(fill="x", padx=16, pady=(10, 0))
+        ctk.CTkLabel(head2, text="ЛОГ WINWS", font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=MUTED).pack(side="left")
+        ctk.CTkButton(head2, text="очистить", width=82, height=24, corner_radius=7,
+                      fg_color="transparent", hover_color=CARD_HOVER, border_width=1,
+                      border_color=BORDER, text_color=MUTED,
+                      font=ctk.CTkFont(size=11),
+                      command=self._clear_log).pack(side="right")
+        self.log_box = ctk.CTkTextbox(log_card, fg_color=CONSOLE_BG, text_color="#9BD49B",
+                                      font=ctk.CTkFont(family="Consolas", size=12),
+                                      corner_radius=10, border_width=0)
+        self.log_box.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        self.log_box.configure(state="disabled")
+        self._log(f"{APP_NAME} v{VERSION}. Нажмите круглую кнопку, чтобы запустить обход.")
+
+    # ---- редактор стратегии (вместо целой вкладки)
+
+    def _open_strategy_editor(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Настройка стратегии")
+        win.geometry("760x460")
+        win.configure(fg_color=BG)
+        win.grab_set()
+        win.after(100, lambda: enable_dark_titlebar(
+            ctypes.windll.user32.GetParent(win.winfo_id())))
+        try:
+            if os.path.isfile(ICON_PATH):
+                win.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+        ctk.CTkLabel(win, text="Выбор стратегии", font=ctk.CTkFont(
+            size=16, weight="bold"), text_color=TEXT).pack(anchor="w", padx=22,
+                                                            pady=(18, 6))
+        names = [s["name"] for s in self.strategies] or ["— нет стратегий —"]
+        var = tk.StringVar(value=names[self.selected] if self.selected is not None
+                           and self.strategies else names[0])
+        menu = ctk.CTkOptionMenu(win, values=names, variable=var, height=36,
+                                 corner_radius=10, fg_color=CARD_HOVER,
+                                 button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+                                 dropdown_fg_color=CARD, dropdown_hover_color=CARD_HOVER,
+                                 command=lambda _v: self._editor_select(names.index(_v)))
+        menu.pack(fill="x", padx=22)
+
+        ctk.CTkLabel(win, text="Аргументы winws (можно править)",
+                     font=ctk.CTkFont(size=13), text_color=MUTED).pack(
+            anchor="w", padx=22, pady=(14, 4))
+        box = ctk.CTkTextbox(win, fg_color=CONSOLE_BG, text_color="#C8D0DC",
+                             font=ctk.CTkFont(family="Consolas", size=11),
+                             corner_radius=10)
+        box.pack(fill="both", expand=True, padx=22)
+        if self.selected is not None and self.strategies:
+            box.insert("1.0", self.strategies[self.selected]["args"])
+
+        def apply_edit():
+            if self.selected is not None and self.strategies:
+                self.strategies[self.selected]["args"] = box.get(
+                    "1.0", "end").strip()
+                self._log("Аргументы стратегии обновлены.")
+            win.destroy()
+
+        rowb = ctk.CTkFrame(win, fg_color="transparent")
+        rowb.pack(fill="x", padx=22, pady=14)
+        ctk.CTkButton(rowb, text="Применить", height=38, corner_radius=10,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=apply_edit).pack(side="right")
+        ctk.CTkButton(rowb, text="Отмена", height=38, corner_radius=10,
+                      fg_color=CARD_HOVER, hover_color="#242A36",
+                      border_width=1, border_color=BORDER, text_color=MUTED,
+                      command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def _editor_select(self, idx):
+        if 0 <= idx < len(self.strategies):
+            self.select_strategy(idx)
+
+    # ---------------------------------------------------------------- автозапуск
+
+    def _build_autostart(self):
+        p = self.pages["autostart"]
+        ctk.CTkLabel(p, text="Автозапуск", font=ctk.CTkFont(size=25, weight="bold"),
+                     text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(p, text="Запуск обхода вместе с входом в Windows",
+                     font=ctk.CTkFont(size=13), text_color=MUTED).pack(
+            anchor="w", pady=(4, 0))
+
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+                            border_color=BORDER)
+        card.pack(fill="x", pady=(18, 0))
+        self.auto_switch = ctk.CTkSwitch(
+            card, text="Автоматически запускать обход при входе в систему",
+            font=ctk.CTkFont(size=15), text_color=TEXT, progress_color=ACCENT,
+            button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+            command=self._toggle_autostart)
+        self.auto_switch.pack(anchor="w", padx=24, pady=(22, 6))
+        if autostart_state():
+            self.auto_switch.select()
+        ctk.CTkLabel(card, text=(f"Создаётся задача планировщика Windows «{AUTOSTART_TASK}» — "
+                                 "сохранённая стратегия запускается\nпри входе в систему "
+                                 "с правами администратора, без окон."),
+                     text_color=MUTED, font=ctk.CTkFont(size=12), justify="left",
+                     wraplength=720).pack(anchor="w", padx=24, pady=(0, 22))
+
+    def _toggle_autostart(self):
+        try:
+            enabled = self.auto_switch.get() == 1
+            autostart_set(enabled)
+            self._log(f"Автозапуск {'включён' if enabled else 'отключён'}.")
+        except Exception as e:
+            self.auto_switch.deselect()
+            messagebox.showerror(APP_NAME, f"Ошибка автозапуска:\n{e}")
+
+    # ---------------------------------------------------------------- о программе
+
+    def _build_about(self):
+        p = self.pages["about"]
+        ctk.CTkLabel(p, text="О программе", font=ctk.CTkFont(size=25, weight="bold"),
+                     text_color=TEXT).pack(anchor="w")
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+                            border_color=BORDER)
+        card.pack(fill="x", pady=(18, 0))
+        ctk.CTkLabel(card, text=(f"{APP_NAME} v{VERSION}\n\n"
+                                 "Графическая обёртка над winws из проекта zapret\n"
+                                 "(github.com/bol-van/zapret).\n\n"
+                                 "Программа читает стратегии из .bat-файлов и запускает winws.exe\n"
+                                 "скрытно, без консольных окон, показывая лог.\n\n"
+                                 "Если папки zapret на ПК нет — используется встроенная копия\n"
+                                 "(распаковывается автоматически при первом запуске).\n\n"
+                                 "Для работы нужны Windows 10/11 и права администратора —\n"
+                                 "драйвер WinDivert перехватывает сетевой трафик."),
+                     text_color=TEXT, font=ctk.CTkFont(size=13), justify="left",
+                     wraplength=740).pack(anchor="w", padx=24, pady=20)
+
+    # ---------------------------------------------------------------- логика
+
+    def _log(self, text: str):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", text.rstrip() + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+    def _choose_dir(self):
+        d = filedialog.askdirectory(title="Папка с zapret",
+                                    initialdir=self.zapret_dir or os.path.expanduser("~"))
+        if d:
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, d)
+            self._apply_dir()
+
+    def _apply_dir(self):
+        d = self.dir_entry.get().strip()
+        if not os.path.isdir(d) or not find_winws(d):
+            messagebox.showerror(APP_NAME, "В этой папке не найден winws.exe.\n"
+                                           "Укажите папку дистрибутива zapret.")
+            return
+        self.zapret_dir = d
+        self.winws_exe = find_winws(d)
+        self.cfg["zapret_dir"] = d
+        save_config(self.cfg)
+        self._reload_strategies()
+        self._log(f"Папка zapret: {d}")
+
+    def _reload_strategies(self):
+        self.strategies = []
+        if self.zapret_dir:
+            for source, name, args in scan_strategies(self.zapret_dir):
+                self.strategies.append({"source": source, "name": name, "args": args})
+        if self.strategies:
+            idx = self.cfg.get("sel_index", 0)
+            if not (0 <= idx < len(self.strategies)):
+                idx = 0
+            self.select_strategy(idx)
+        else:
+            self.hero_name.configure(text="— стратегии не найдены —")
+            self.hero_source.configure(text="укажите папку с zapret ниже")
+
+    def select_strategy(self, idx):
+        self.selected = idx
+        s = self.strategies[idx]
+        self.hero_name.configure(text=s["name"])
+        self.hero_source.configure(text=f"{s['source']} · {len(self.strategies)} стратегий")
+        self.cfg["sel_index"] = idx
+        save_config(self.cfg)
+
+    def _current_args(self):
+        return self.strategies[self.selected]["args"] if (
+                self.selected is not None and self.strategies) else ""
+
+    def _toggle_power(self):
+        if self.proc and self.proc.poll() is None:
+            self._stop()
+        else:
+            self._start()
+
+    def _start(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        if not self.winws_exe:
+            messagebox.showerror(APP_NAME, "winws.exe не найден. Укажите папку с zapret.")
+            return
+        if not is_admin():
+            messagebox.showerror(APP_NAME, "Нужны права администратора.\n"
+                                           "Перезапустите программу от имени администратора.")
+            if relaunch_as_admin():
+                self.destroy()
+            return
+        args = self._current_args()
+        if not args:
+            messagebox.showwarning(APP_NAME, "Нет аргументов — выберите стратегию (⚙).")
+            return
+        if winws_already_running():
+            if messagebox.askyesno(
+                    APP_NAME,
+                    "Найден уже запущенный winws (служба или батник).\n"
+                    "Его фильтры пересекаются с нашей копией и ломают обход.\n\n"
+                    "Остановить чужой winws и запустить свою копию?"):
+                kill_foreign_winws()
+                time.sleep(1)
+            else:
+                return
+
+        cmd_line = f'"{self.winws_exe}" {args}'
+        self._log(f"> {cmd_line}")
+        try:
+            self.proc = subprocess.Popen(
+                cmd_line, cwd=os.path.dirname(self.winws_exe),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=CREATE_NO_WINDOW)
+        except OSError as e:
+            self._log(f"Ошибка запуска: {e}")
+            messagebox.showerror(APP_NAME, f"Не удалось запустить winws:\n{e}")
+            return
+        threading.Thread(target=self._reader, daemon=True).start()
+        if self.auto_switch.get() == 1:
+            try:
+                autostart_set(True)
+                self._log("Задача автозапуска обновлена.")
+            except Exception as e:
+                self._log(f"Автозапуск не обновлён: {e}")
+
+    def _autorun_start(self):
+        if self.winws_exe and self.strategies:
+            self._start()
+
+    def _reader(self):
+        proc = self.proc
+        while proc and proc.poll() is None:
+            raw = proc.stdout.readline()
+            if not raw:
+                break
+            self.after(0, self._log, decode_console(raw))
+        if proc:
+            raw = proc.stdout.read()
+            if raw:
+                self.after(0, self._log, decode_console(raw))
+            rc = proc.poll()
+            self.after(0, self._log, f"--- winws завершён (код {rc}) ---")
+
+    def _stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self._log("Обход остановлен.")
+        self.proc = None
+
+    def _poll_process(self):
+        running = bool(self.proc and self.proc.poll() is None)
+        if running:
+            self.side_status_dot.configure(text_color=GREEN)
+            self.side_status_text.configure(text="обход работает", text_color=TEXT)
+            self.btn_power.configure(text="■", fg_color=RED, hover_color="#E04553",
+                                     font=ctk.CTkFont(size=34))
+            self.power_glow.configure(fg_color=TINT_RED)
+            self.power_caption.configure(text="остановить обход", text_color="#FF9AA5")
+            self.status_pill.configure(fg_color=TINT_GREEN, border_color="#1E4433")
+            self.status_dot.configure(text_color=GREEN)
+            self.status_text.configure(text="работает", text_color=GREEN)
+        else:
+            self.side_status_dot.configure(text_color=MUTED)
+            self.side_status_text.configure(text="winws не запущен", text_color=MUTED)
+            self.btn_power.configure(text="▶", fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                     font=ctk.CTkFont(size=42))
+            self.power_glow.configure(fg_color="#141233")
+            self.power_caption.configure(text="запустить обход", text_color=MUTED)
+            self.status_pill.configure(fg_color=TINT_AMBER, border_color="#3D3418")
+            self.status_dot.configure(text_color=AMBER)
+            self.status_text.configure(text="не запущен", text_color=AMBER)
+        self.after(500, self._poll_process)
+
+    def _ask_elevation(self):
+        if messagebox.askyesno(
+                APP_NAME,
+                "Для работы winws (драйвер WinDivert) нужны права администратора.\n"
+                "Перезапустить программу от имени администратора?"):
+            if relaunch_as_admin():
+                self.destroy()
+
+    def _on_close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+        save_config(self.cfg)
+        self.destroy()
+
+
+def main():
+    if "--setup-embedded" in sys.argv:
+        # скрытый тестовый режим: распаковать встроенную копию и выйти
+        result = ensure_embedded_zapret()
+        try:
+            with open(os.path.join(os.environ.get("TEMP", "."), "grom-embedded.txt"),
+                      "w", encoding="utf-8") as f:
+                f.write(str(result))
+        except OSError:
+            pass
+        return
+    autorun = "--autorun" in sys.argv
+    app = App(autorun=autorun)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

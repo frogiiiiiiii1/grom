@@ -1,0 +1,12 @@
+dist/
+build/
+__pycache__/
+*.pyc
+*.spec
+_test_out.txt
+grom_icon_preview.png
+*.backup
+gh_auth.cmd
+gh_auth.txt
+menu_esp_aim.lua
+readme.txt
