@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.11
+grom обходник — обёртка над winws (zapret) для Windows. v1.12
 
 * Тёмный интерфейс, без консольных окон
 * VPN-страница (как в happ): подписка, серверы с флагами стран, обновление
   (вручную и автоматически каждый час), проверка пинга, подключение через
   встроенный sing-box + системный прокси; оповещение, если сервер сдохнет
-* Копирование/вставка правой кнопкой мыши в полях и логе
-* Обновлённая иконка и дизайн (чипы меню, стеклянный логотип,
-  градиентные акценты, кольцо-гロー у круглой кнопки)
+* Копирование/вставка: правая кнопка мыши, Ctrl+C/V/X/A, кнопки
+  «вставить» у подписки и «копировать» у лога
+* Иконка окна: WinAPI + Tk + PNG (исправлена маска — раньше иконка
+  обрезалась углом и в заголовке её не было видно)
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
 * Идеально круглая кнопка запуска с плавными анимациями
 * Анимации страниц, меню и статусов
@@ -39,7 +40,7 @@ from PIL import Image, ImageOps
 import vpn_core
 
 APP_NAME = "grom обходник"
-VERSION = "1.11"
+VERSION = "1.12"
 VPN_CHECK_INTERVAL = 20     # сек между проверками живости VPN-сервера
 VPN_DEAD_FAILS = 3          # столько молчаний подряд = сервер сдох
 AUTOSTART_TASK = "grom"
@@ -263,6 +264,38 @@ def enable_dark_titlebar(hwnd):
             ctypes.c_void_p(hwnd), 20, ctypes.byref(val), ctypes.sizeof(val))
     except Exception:
         pass
+
+
+def set_win32_icon(hwnd, ico_path=None):
+    """Ставит иконку окна напрямую через WinAPI (WM_SETICON).
+
+    Tk в собранном exe не всегда подхватывает .ico — этот способ надёжнее.
+    """
+    if ico_path is None:
+        ico_path = ICON_PATH
+    if not hwnd or not os.path.isfile(ico_path):
+        return False
+    try:
+        u32 = ctypes.windll.user32
+        u32.LoadImageW.restype = ctypes.c_void_p
+        u32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                   ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+        u32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                     ctypes.c_size_t, ctypes.c_void_p]
+        u32.SendMessageW.restype = ctypes.c_void_p
+        big = u32.LoadImageW(None, ico_path, 1, 256, 256, 0x10)  # IMAGE_ICON
+        sm = u32.LoadImageW(None, ico_path, 1, 32, 32, 0x10)
+        ok = False
+        if sm:
+            u32.SendMessageW(hwnd, 0x80, 0, sm)   # WM_SETICON, ICON_SMALL
+            ok = True
+        if big:
+            u32.SendMessageW(hwnd, 0x80, 1, big)  # WM_SETICON, ICON_BIG
+            ok = True
+        return ok
+    except Exception:
+        return False
 
 
 def decode_console(raw: bytes) -> str:
@@ -696,12 +729,15 @@ class App(ctk.CTk):
         self.geometry("1020x720")
         self.minsize(940, 640)
         self.configure(fg_color=BG)
+        self._icon_tk_ok = False
         try:
             if os.path.isfile(ICON_PATH):
                 self.iconbitmap(ICON_PATH)
+                self._icon_tk_ok = True
         except Exception:
             pass
         # второй источник иконки окна (taskbar/alt-tab): PNG 256px
+        self._icon_photo_ok = False
         try:
             png = os.path.join(
                 getattr(sys, "_MEIPASS",
@@ -710,6 +746,7 @@ class App(ctk.CTk):
             if os.path.isfile(png):
                 self._win_icon_img = tk.PhotoImage(file=png)
                 self.iconphoto(True, self._win_icon_img)
+                self._icon_photo_ok = True
         except Exception:
             pass
 
@@ -766,6 +803,7 @@ class App(ctk.CTk):
         try:
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
             enable_dark_titlebar(hwnd)
+            self._icon_win_ok = set_win32_icon(hwnd)
         except Exception:
             pass
 
@@ -817,12 +855,13 @@ class App(ctk.CTk):
         def _copy_sel():
             try:
                 if kind == "entry":
-                    inner.selection_get()
+                    sel = inner.selection_get()
                 else:
-                    inner.get("sel.first", "sel.last")
-                inner.event_generate("<<Copy>>")
+                    sel = inner.get("sel.first", "sel.last")
             except tk.TclError:
-                pass
+                return
+            inner.clipboard_clear()
+            inner.clipboard_append(sel)
 
         def _copy_all():
             try:
@@ -835,15 +874,34 @@ class App(ctk.CTk):
 
         def _paste():
             try:
-                inner.event_generate("<<Paste>>")
+                txt = inner.clipboard_get()
+            except tk.TclError:
+                return
+            try:                       # выделение заменяется вставленным
+                if kind == "entry":
+                    a = inner.index("sel.first")
+                    b = inner.index("sel.last")
+                else:
+                    a, b = "sel.first", "sel.last"
+                inner.delete(a, b)
             except tk.TclError:
                 pass
+            inner.insert("insert", txt)
 
         def _cut():
             try:
-                inner.event_generate("<<Cut>>")
+                if kind == "entry":
+                    sel = inner.selection_get()
+                    a = inner.index("sel.first")
+                    b = inner.index("sel.last")
+                else:
+                    sel = inner.get("sel.first", "sel.last")
+                    a, b = "sel.first", "sel.last"
             except tk.TclError:
-                pass
+                return
+            inner.clipboard_clear()
+            inner.clipboard_append(sel)
+            inner.delete(a, b)
 
         def _select_all():
             try:
@@ -878,11 +936,35 @@ class App(ctk.CTk):
                 except tk.TclError:
                     pass
 
-        for seq in ("<Button-3>", "<Shift-F10>", "<Control-Mouse-2>"):
+        for seq in ("<Button-3>", "<Menu>", "<Shift-F10>",
+                    "<Control-Mouse-2>"):
+            for wdg in (inner, widget):
+                try:
+                    wdg.bind(seq, _popup)
+                except tk.TclError:
+                    pass
+
+        # прямые сочетания Ctrl+C/V/X/A — не полагаемся на встроенную
+        # обработку виртуальных событий Tk
+        seqs = {"<Control-c>": _copy_sel, "<Control-a>": _select_all}
+        if not log_mode:
+            seqs["<Control-v>"] = _paste
+            seqs["<Control-x>"] = _cut
+        for seq, fn in seqs.items():
+            def _key(ev, f=fn):
+                try:
+                    f()
+                except tk.TclError:
+                    pass
+                return "break"
             try:
-                inner.bind(seq, _popup)
+                inner.bind(seq, _key)
             except tk.TclError:
                 pass
+        try:
+            widget._ctx_menu = menu      # для тестов/диагностики
+        except Exception:
+            pass
 
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=244, fg_color=SIDEBAR, corner_radius=0)
@@ -1243,6 +1325,11 @@ class App(ctk.CTk):
                       border_color=BORDER, text_color=MUTED,
                       font=ctk.CTkFont(size=11),
                       command=self._clear_log).pack(side="right")
+        ctk.CTkButton(head2, text="копировать", width=94, height=24, corner_radius=7,
+                      fg_color="transparent", hover_color=CARD_HOVER, border_width=1,
+                      border_color=BORDER, text_color=MUTED,
+                      font=ctk.CTkFont(size=11),
+                      command=self._copy_log).pack(side="right", padx=(0, 8))
         self.log_box = ctk.CTkTextbox(log_card, fg_color=CONSOLE_BG, text_color="#9BD49B",
                                       font=ctk.CTkFont(family="Consolas", size=12),
                                       corner_radius=10, border_width=0)
@@ -1267,6 +1354,8 @@ class App(ctk.CTk):
                 win.iconbitmap(ICON_PATH)
         except Exception:
             pass
+        win.after(120, lambda: set_win32_icon(
+            ctypes.windll.user32.GetParent(win.winfo_id())))
 
         ctk.CTkLabel(win, text="Выбор стратегии", font=ctk.CTkFont(
             size=16, weight="bold"), text_color=TEXT).pack(anchor="w", padx=22,
@@ -1474,6 +1563,11 @@ class App(ctk.CTk):
         if self._vpn_sub_url:
             self.vpn_sub_entry.insert(0, self._vpn_sub_url)
         self._attach_context(self.vpn_sub_entry)
+        ctk.CTkButton(
+            row, text="вставить", width=84, height=36, corner_radius=9,
+            fg_color="transparent", hover_color=CARD_HOVER, border_width=1,
+            border_color=BORDER, text_color=MUTED, font=ctk.CTkFont(size=12),
+            command=self._vpn_paste_url).pack(side="left", padx=(10, 0))
         self.vpn_fetch_btn = ctk.CTkButton(
             row, text="обновить серверы", width=150, height=36, corner_radius=9,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
@@ -1546,6 +1640,20 @@ class App(ctk.CTk):
                          "hysteria2 и tuic.")
         except Exception:
             pass
+
+    def _vpn_paste_url(self):
+        """Кнопка «вставить»: ссылка подписки из буфера в поле."""
+        try:
+            txt = self.clipboard_get().strip()
+        except tk.TclError:
+            txt = ""
+        if not txt:
+            messagebox.showinfo(APP_NAME, "Буфер обмена пуст — "
+                                          "сначала скопируйте ссылку подписки.")
+            return
+        self.vpn_sub_entry.delete(0, "end")
+        self.vpn_sub_entry.insert(0, txt)
+        self._vpn_update_hint()
 
     def _vpn_tick(self):
         """Каждый час тихо обновляем подписку, если ссылка есть."""
@@ -2280,6 +2388,18 @@ class App(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
+    def _copy_log(self):
+        """Кнопка «копировать»: весь лог в буфер обмена."""
+        try:
+            txt = self.log_box.get("1.0", "end-1c")
+            if not txt:
+                return
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self._log("лог скопирован в буфер обмена")
+        except Exception:
+            pass
+
     def _choose_dir(self):
         d = filedialog.askdirectory(title="Папка с zapret",
                                     initialdir=self.zapret_dir or os.path.expanduser("~"))
@@ -2493,6 +2613,49 @@ def main():
                 f.write(str(result))
         except OSError:
             pass
+        return
+    if "--uicheck" in sys.argv:
+        # скрытый режим диагностики: окно без UAC + отчёт об иконках
+        globals()["is_admin"] = lambda: True
+        App._ask_elevation = lambda self: None
+        app = App()
+
+        def dump():
+            info = [f"VERSION {VERSION}"]
+            info.append(f"icon ico file: {os.path.isfile(ICON_PATH)}")
+            info.append(f"iconbitmap tk: {app._icon_tk_ok}")
+            info.append(f"iconphoto tk: {app._icon_photo_ok}")
+            info.append(f"winapi icon: {getattr(app, '_icon_win_ok', '?')}")
+            try:
+                u32 = ctypes.windll.user32
+                hwnd = u32.GetParent(app.winfo_id())
+                u32.GetClassLongPtrW.restype = ctypes.c_void_p
+                big = u32.GetClassLongPtrW(hwnd, -14)   # GCLP_HICON
+                sm = u32.GetClassLongPtrW(hwnd, -34)    # GCLP_HICONSM
+                info.append(f"hicon={big} hiconsm={sm}")
+            except Exception as e:
+                info.append(f"winapi err: {e}")
+            try:
+                info.append(f"sidebar img: "
+                            f"{bool(app.logo_badge_glyph.cget('image'))}")
+            except Exception as e:
+                info.append(f"sidebar err: {e}")
+            try:
+                menu = app.vpn_sub_entry._ctx_menu
+                info.append(f"ctx menu: {bool(menu)}")
+            except Exception as e:
+                info.append(f"ctx err: {e}")
+            try:
+                with open(os.path.join(os.environ.get("TEMP", "."),
+                                       "grom-uicheck.txt"),
+                          "w", encoding="utf-8") as f:
+                    f.write("\n".join(info))
+            except OSError:
+                pass
+
+        app.after(1500, dump)
+        app.after(2200, app.destroy)
+        app.mainloop()
         return
     autorun = "--autorun" in sys.argv
     app = App(autorun=autorun)

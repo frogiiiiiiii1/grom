@@ -178,7 +178,8 @@ rim = ImageChops.multiply(rim, fade).point(lambda v: int(v * 0.85))
 img = Image.composite(Image.new("RGB", (S, S), (255, 255, 255)), img, rim)
 
 # ------------------------------------------------------------------ маска
-mask = superellipse_mask(S * 2).resize((S, S), Image.LANCZOS)
+# центр маски — середина холста (раньше был (0,0) — иконка обрезалась углом)
+mask = superellipse_mask(S * 2, center=(S, S)).resize((S, S), Image.LANCZOS)
 img = img.convert("RGBA")
 img.putalpha(mask)
 
