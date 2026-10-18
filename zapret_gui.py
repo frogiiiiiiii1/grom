@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.6
+grom обходник — обёртка над winws (zapret) для Windows. v1.7
 
 * Тёмный интерфейс, без консольных окон
 * Разбор батников дистрибутива (zapret-win-bundle и стандартный формат)
 * Идеально круглая кнопка запуска с плавными анимациями
 * Анимации страниц, меню и статусов
+* Вкладка «Тема»: цветовые темы, свой акцент, фон-картинка, скругление
 * Автозапуск обхода при открытии программы и при входе в Windows
 * Внутри встроен дистрибутив zapret — работает и без папки zapret на ПК
 * Всё в одном exe: pyinstaller --onefile --noconsole zapret_gui.py
@@ -22,12 +23,13 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox
 
 import customtkinter as ctk
+from PIL import Image, ImageOps
 
 APP_NAME = "grom обходник"
-VERSION = "1.6"
+VERSION = "1.7"
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -86,6 +88,58 @@ def lerp_color(c1, c2, t):
 def lighten(color, amt):
     r, g, b = hex_to_rgb(color)
     return rgb_to_hex((r + amt, g + amt, b + amt))
+
+
+# текущий радиус скругления карточек (настраивается на странице «Тема»)
+RADIUS = 16
+
+# пресеты оформления: фон, карточки, рамка + акцент по умолчанию
+THEME_PRESETS = {
+    "violet": {"name": "Ночной фиолет",
+               "bg": "#0A0C10", "sidebar": "#0D0F15", "card": "#161B27",
+               "card_hover": "#1D2432", "console": "#090B0F", "border": "#2A3145",
+               "accent": "#7C6CFF"},
+    "ocean": {"name": "Океан",
+              "bg": "#070C14", "sidebar": "#0A1120", "card": "#121C2C",
+              "card_hover": "#1A2739", "console": "#050810", "border": "#24344A",
+              "accent": "#38B6FF"},
+    "malachite": {"name": "Малахит",
+                  "bg": "#070D0A", "sidebar": "#0A120D", "card": "#12201A",
+                  "card_hover": "#1A2C23", "console": "#050907", "border": "#24382D",
+                  "accent": "#2BD576"},
+    "magma": {"name": "Магма",
+              "bg": "#120C08", "sidebar": "#160F0A", "card": "#221812",
+              "card_hover": "#2C2018", "console": "#0E0906", "border": "#3C2C1E",
+              "accent": "#FF8A3D"},
+    "mono": {"name": "Монохром",
+             "bg": "#0D0D0F", "sidebar": "#111114", "card": "#1A1A1E",
+             "card_hover": "#232329", "console": "#0A0A0C", "border": "#2E2E36",
+             "accent": "#E8E8F0"},
+}
+
+BG_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "bg")
+
+
+def apply_theme(preset: str, accent: str = None):
+    """Ставит палитру темы в глобальные константы оформления."""
+    global BG, SIDEBAR, CARD, CARD_HOVER, CONSOLE_BG, BORDER
+    global ACCENT, ACCENT_HOVER, ACTIVE_BG, ACTIVE_HOVER, ACTIVE_TEXT
+    global ACCENT_DIM, ACCENT_BRIGHT
+    t = THEME_PRESETS.get(preset) or THEME_PRESETS["violet"]
+    BG = t["bg"]
+    SIDEBAR = t["sidebar"]
+    CARD = t["card"]
+    CARD_HOVER = t["card_hover"]
+    CONSOLE_BG = t["console"]
+    BORDER = t["border"]
+    ACCENT = accent or t["accent"]
+    # производные оттенки акцента — автоматически под новый цвет
+    ACCENT_HOVER = lerp_color(ACCENT, "#000000", 0.18)
+    ACTIVE_TEXT = lerp_color(ACCENT, "#FFFFFF", 0.28)
+    ACTIVE_BG = lerp_color(BG, ACCENT, 0.14)
+    ACTIVE_HOVER = lerp_color(BG, ACCENT, 0.19)
+    ACCENT_DIM = lerp_color(BG, ACCENT, 0.12)
+    ACCENT_BRIGHT = lerp_color(BG, ACCENT, 0.22)
 
 
 class CircleButton(tk.Frame):
@@ -506,6 +560,13 @@ class App(ctk.CTk):
         self._current_page = None
         self.cfg = load_config()
         self.cfg.pop("services", None)
+        self._radius_widgets = []
+        self._init_theme()
+        self._log_lines = []
+        self._bg_label = None
+        self._bg_photo = None
+        self._bg_src = None
+        self._bg_job = None
 
         self.title(f"{APP_NAME} · v{VERSION}")
         self.geometry("1020x720")
@@ -608,6 +669,7 @@ class App(ctk.CTk):
         self.nav_indicators = {}
         for key, label, icon in (("home", "Главная", "⌂"),
                                  ("autostart", "Автозапуск", "↻"),
+                                 ("theme", "Тема", "◑"),
                                  ("about", "О программе", "ⓘ")):
             wrap = ctk.CTkFrame(self.sidebar, fg_color="transparent")
             wrap.pack(fill="x", padx=14, pady=3)
@@ -709,15 +771,22 @@ class App(ctk.CTk):
         self.page_hosts = {}
         self.content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self.content.pack(side="left", fill="both", expand=True)
-        for key in ("home", "autostart", "about"):
-            # обычный tk.Frame-хост: через него работает слайд-анимация
-            self.page_hosts[key] = tk.Frame(self.content, bg=BG)
-            self.pages[key] = ctk.CTkFrame(self.page_hosts[key], fg_color=BG,
+        for key in ("home", "autostart", "theme", "about"):
+            # прозрачный хост: через него работает слайд-анимация,
+            # а снизу (если задан) видна картинка-фон
+            self.page_hosts[key] = ctk.CTkFrame(self.content,
+                                                fg_color="transparent",
+                                                corner_radius=0)
+            self.pages[key] = ctk.CTkFrame(self.page_hosts[key],
+                                           fg_color="transparent",
                                            corner_radius=0)
             self.pages[key].pack(fill="both", expand=True, padx=30, pady=26)
         self._build_home()
         self._build_autostart()
+        self._build_theme()
         self._build_about()
+        self._apply_background()
+        self.content.bind("<Configure>", self._on_content_resize)
 
     def show_page(self, key):
         if key == self._current_page:
@@ -787,7 +856,7 @@ class App(ctk.CTk):
         self.status_text.pack(side="left", padx=(0, 12), pady=5)
 
         # ---- hero-карточка
-        hero = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+        hero = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
                             border_color=BORDER)
         hero.pack(fill="x", pady=(20, 0))
         ctk.CTkFrame(hero, width=104, height=5, corner_radius=3,
@@ -863,7 +932,7 @@ class App(ctk.CTk):
                       command=self._apply_dir).pack(side="left", padx=(6, 0))
 
         # ---- лог
-        log_card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+        log_card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
                                 border_color=BORDER)
         log_card.pack(fill="both", expand=True, pady=(14, 0))
         head2 = ctk.CTkFrame(log_card, fg_color="transparent")
@@ -882,7 +951,8 @@ class App(ctk.CTk):
                                       corner_radius=10, border_width=0)
         self.log_box.pack(fill="both", expand=True, padx=12, pady=(8, 12))
         self.log_box.configure(state="disabled")
-        self._log(f"{APP_NAME} v{VERSION}. Нажмите круглую кнопку, чтобы запустить обход.")
+        if not self._log_lines:
+            self._log(f"{APP_NAME} v{VERSION}. Нажмите круглую кнопку, чтобы запустить обход.")
 
     # ---- редактор стратегии (вместо целой вкладки)
 
@@ -954,7 +1024,7 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=13), text_color=MUTED).pack(
             anchor="w", pady=(4, 0))
 
-        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
                             border_color=BORDER)
         card.pack(fill="x", pady=(18, 0))
         top = ctk.CTkFrame(card, fg_color="transparent")
@@ -1000,6 +1070,327 @@ class App(ctk.CTk):
             self.auto_switch.deselect()
             messagebox.showerror(APP_NAME, f"Ошибка автозапуска:\n{e}")
 
+    # ---------------------------------------------------------------- тема
+
+    def _build_theme(self):
+        p = self.pages["theme"]
+        ctk.CTkLabel(p, text="Тема", font=ctk.CTkFont(size=25, weight="bold"),
+                     text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(p, text="Цвет, фон и скругление — применяется сразу",
+                     font=ctk.CTkFont(size=13), text_color=MUTED).pack(
+            anchor="w", pady=(4, 0))
+
+        th = self.cfg.get("theme") or {}
+        preset = str(th.get("preset", "violet"))
+        accent = th.get("accent")
+
+        # ---- цветовая тема
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
+                            border_color=BORDER)
+        card.pack(fill="x", pady=(18, 0))
+        ctk.CTkLabel(card, text="Ц В Е Т О В А Я   Т Е М А",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 8))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=22, pady=(0, 18))
+        for key, t in THEME_PRESETS.items():
+            chip = ctk.CTkFrame(row, width=128, height=58, corner_radius=12,
+                                fg_color=t["card"],
+                                border_width=2 if key == preset else 1,
+                                border_color=ACCENT if key == preset else BORDER)
+            chip.pack(side="left", padx=(0, 10))
+            chip.pack_propagate(False)
+            ctk.CTkFrame(chip, width=26, height=26, corner_radius=13,
+                         fg_color=t["accent"]).pack(padx=(12, 0), pady=(10, 0))
+            ctk.CTkLabel(chip, text=t["name"], font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=TEXT).pack(anchor="w", padx=12, pady=(4, 0))
+            for w in (chip, *chip.winfo_children()):
+                w.bind("<Button-1>", lambda e, k=key: self._set_preset(k))
+
+        # ---- акцентный цвет
+        card2 = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
+                             border_color=BORDER)
+        card2.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(card2, text="А К Ц Е Н Т Н Ы Й   Ц В Е Т",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 8))
+        sw_row = ctk.CTkFrame(card2, fg_color="transparent")
+        sw_row.pack(fill="x", padx=22, pady=(0, 6))
+        cur_accent = (accent or THEME_PRESETS[preset]["accent"]).upper()
+        for c in ("#7C6CFF", "#38B6FF", "#2BD576", "#FFB454",
+                  "#FF5D6C", "#FF6FCF", "#E8E8F0", "#56C2D9"):
+            sw = ctk.CTkButton(sw_row, text="", width=38, height=38,
+                               corner_radius=19, fg_color=c,
+                               hover_color=lighten(c, 24),
+                               border_width=2 if c.upper() == cur_accent else 0,
+                               border_color=TEXT,
+                               command=lambda col=c: self._set_accent(col))
+            sw.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(sw_row, text="свой…", width=74, height=38, corner_radius=19,
+                      fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+                      border_color=BORDER, text_color=TEXT,
+                      font=ctk.CTkFont(size=12),
+                      command=self._pick_custom_accent).pack(side="left")
+        ctk.CTkLabel(card2, text="Выбор темы возвращает акцент к стандартному — "
+                                 "свой цвет можно поставить после.",
+                     font=ctk.CTkFont(size=11), text_color=MUTED).pack(
+            anchor="w", padx=22, pady=(0, 16))
+
+        # ---- фон и скругление
+        card3 = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
+                             border_color=BORDER)
+        card3.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(card3, text=" Ф О Н   И   У Г Л Ы ",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=MUTED).pack(anchor="w", padx=22, pady=(16, 8))
+
+        bg_row = ctk.CTkFrame(card3, fg_color="transparent")
+        bg_row.pack(fill="x", padx=22, pady=(0, 4))
+        ctk.CTkButton(bg_row, text="выбрать картинку…", height=34, corner_radius=9,
+                      fg_color=CARD_HOVER, hover_color="#242A36", border_width=1,
+                      border_color=BORDER, text_color=TEXT,
+                      font=ctk.CTkFont(size=12),
+                      command=self._pick_bg_image).pack(side="left")
+        ctk.CTkButton(bg_row, text="убрать фон", height=34, corner_radius=9,
+                      fg_color="transparent", hover_color=CARD_HOVER,
+                      border_width=1, border_color=BORDER, text_color=MUTED,
+                      font=ctk.CTkFont(size=12),
+                      command=self._remove_bg).pack(side="left", padx=(8, 0))
+        self.bg_name_label = ctk.CTkLabel(
+            bg_row, text=(os.path.basename(th.get("bg_image") or "") or "фон не задан"),
+            font=ctk.CTkFont(size=11), text_color=MUTED)
+        self.bg_name_label.pack(side="left", padx=(12, 0))
+
+        dim_row = ctk.CTkFrame(card3, fg_color="transparent")
+        dim_row.pack(fill="x", padx=22, pady=(6, 0))
+        ctk.CTkLabel(dim_row, text="затемнение", font=ctk.CTkFont(size=12),
+                     text_color=MUTED, width=90, anchor="w").pack(side="left")
+        self.dim_slider = ctk.CTkSlider(
+            dim_row, from_=20, to=88, number_of_steps=34, height=18,
+            progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            command=self._on_dim_change)
+        self.dim_slider.pack(side="left", fill="x", expand=True, padx=10)
+        self.dim_slider.set(int(th.get("bg_dim", 60)))
+        ctk.CTkLabel(dim_row, text="чем больше — тем темнее картинка",
+                     font=ctk.CTkFont(size=11), text_color=MUTED).pack(side="left")
+
+        rad_row = ctk.CTkFrame(card3, fg_color="transparent")
+        rad_row.pack(fill="x", padx=22, pady=(10, 0))
+        ctk.CTkLabel(rad_row, text="углы", font=ctk.CTkFont(size=12),
+                     text_color=MUTED, width=90, anchor="w").pack(side="left")
+        self.rad_slider = ctk.CTkSlider(
+            rad_row, from_=0, to=24, number_of_steps=24, height=18,
+            progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            command=self._on_radius_change)
+        self.rad_slider.pack(side="left", fill="x", expand=True, padx=10)
+        self.rad_slider.set(RADIUS)
+        self.rad_value = ctk.CTkLabel(rad_row, text=f"{RADIUS} px",
+                                      font=ctk.CTkFont(size=11), text_color=MUTED,
+                                      width=44)
+        self.rad_value.pack(side="left")
+        ctk.CTkFrame(card3, height=14, fg_color="transparent").pack()
+
+        # ---- сброс
+        ctk.CTkButton(p, text="вернуть стандартное оформление", height=34,
+                      corner_radius=9, fg_color="transparent",
+                      hover_color=CARD_HOVER, border_width=1, border_color=BORDER,
+                      text_color=MUTED, font=ctk.CTkFont(size=12),
+                      command=self._reset_theme).pack(anchor="w", pady=(14, 0))
+
+    # ---- действия темы
+
+    def _theme_save(self):
+        save_config(self.cfg)
+
+    def _set_preset(self, key):
+        th = self.cfg.get("theme") or {}
+        th["preset"] = key
+        th["accent"] = None          # акцент пресета; свой цвет ставится отдельно
+        self.cfg["theme"] = th
+        self._theme_save()
+        self._log(f"Тема: «{THEME_PRESETS[key]['name']}».")
+        self._rebuild_ui()
+
+    def _set_accent(self, color):
+        th = self.cfg.get("theme") or {}
+        th["accent"] = color
+        self.cfg["theme"] = th
+        self._theme_save()
+        self._log(f"Акцентный цвет: {color}.")
+        self._rebuild_ui()
+
+    def _pick_custom_accent(self):
+        cur = ((self.cfg.get("theme") or {}).get("accent")
+               or THEME_PRESETS[((self.cfg.get("theme") or {}).get("preset", "violet"))]["accent"])
+        res = colorchooser.askcolor(color=cur, title="Свой акцентный цвет",
+                                    parent=self)
+        if res and res[1]:
+            self._set_accent(res[1].upper())
+
+    def _pick_bg_image(self):
+        path = filedialog.askopenfilename(
+            title="Картинка на фон",
+            filetypes=[("Изображения", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                       ("Все файлы", "*.*")], parent=self)
+        if not path:
+            return
+        try:
+            os.makedirs(BG_DIR, exist_ok=True)
+            ext = os.path.splitext(path)[1].lower() or ".png"
+            dst = os.path.join(BG_DIR, "background" + ext)
+            shutil.copy2(path, dst)
+            Image.open(dst).verify()      # проверка, что файл — картинка
+            th = self.cfg.get("theme") or {}
+            th["bg_image"] = dst
+            th.setdefault("bg_dim", 60)
+            self.cfg["theme"] = th
+            self._theme_save()
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Не удалось поставить картинку:\n{e}")
+            return
+        self._log("Фон: картинка установлена.")
+        self._rebuild_ui()
+
+    def _remove_bg(self):
+        th = self.cfg.get("theme") or {}
+        if not th.get("bg_image"):
+            return
+        th["bg_image"] = None
+        self.cfg["theme"] = th
+        self._theme_save()
+        self._log("Фон: картинка убрана.")
+        self._rebuild_ui()
+
+    def _on_dim_change(self, v):
+        th = self.cfg.get("theme") or {}
+        th["bg_dim"] = int(float(v))
+        self.cfg["theme"] = th
+        self._theme_save()
+        self._render_background()
+
+    def _on_radius_change(self, v):
+        global RADIUS
+        old = RADIUS
+        RADIUS = int(float(v))
+        self.rad_value.configure(text=f"{RADIUS} px")
+        th = self.cfg.get("theme") or {}
+        th["radius"] = RADIUS
+        self.cfg["theme"] = th
+        self._theme_save()
+        if RADIUS == old:
+            return
+        # перерисовать скругления карточек: меняем фреймы с прежним радиусом
+        for w in self._walk_widgets():
+            if not isinstance(w, ctk.CTkFrame):
+                continue
+            try:
+                r = w.cget("corner_radius")
+            except Exception:
+                continue
+            if r == old:
+                try:
+                    w.configure(corner_radius=RADIUS)
+                except Exception:
+                    pass
+
+    def _reset_theme(self):
+        self.cfg["theme"] = {}
+        self._theme_save()
+        self._log("Оформление сброшено к стандартному.")
+        self._rebuild_ui()
+
+    def _rebuild_ui(self):
+        """Пересобрать интерфейс с новыми цветами (процесс winws не трогается)."""
+        page = self._current_page or "home"
+        self._init_theme()          # применить тему/акцент/углы из конфига
+        self.configure(fg_color=BG)
+        self._radius_widgets = []
+        for w in self.winfo_children():
+            w.destroy()
+        self._bg_label = None
+        self._bg_photo = None
+        self._bg_src = None
+        self._bg_job = None
+        self._current_page = None
+        self._build_sidebar()
+        self._build_pages()
+        self._apply_dark_titlebar()
+        self.show_page(page)
+        # вернуть лог и состояние
+        if self._log_lines:
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", "\n".join(self._log_lines) + "\n")
+            self.log_box.configure(state="disabled")
+            self.log_box.see("end")
+        if self.strategies:
+            if 0 <= (self.selected or 0) < len(self.strategies):
+                self.select_strategy(self.selected or 0)
+        self._shown_running = None   # существующий цикл опроса сам обновит статус
+
+    def _walk_widgets(self):
+        out = []
+        stack = [self]
+        while stack:
+            w = stack.pop()
+            out.append(w)
+            try:
+                stack.extend(w.winfo_children())
+            except Exception:
+                pass
+        return out
+
+    # ---- фон-картинка
+
+    def _init_theme(self):
+        """Применить сохранённую тему до построения виджетов."""
+        global RADIUS
+        th = self.cfg.get("theme") or {}
+        apply_theme(str(th.get("preset", "violet")), th.get("accent"))
+        try:
+            RADIUS = max(0, min(24, int(th.get("radius", 16))))
+        except Exception:
+            RADIUS = 16
+
+    def _apply_background(self):
+        th = self.cfg.get("theme") or {}
+        path = th.get("bg_image")
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            self._bg_src = Image.open(path).convert("RGB")
+        except Exception:
+            return
+        self._bg_label = ctk.CTkLabel(self.content, text="", fg_color="transparent")
+        self._bg_label.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._bg_label.lower()
+        self._render_background()
+
+    def _render_background(self):
+        if not self._bg_label or not self._bg_src:
+            return
+        try:
+            w = max(self.content.winfo_width(), 200)
+            h = max(self.content.winfo_height(), 200)
+            dim = int((self.cfg.get("theme") or {}).get("bg_dim", 60))
+            alpha = max(0.12, min(0.88, (100 - dim) / 100))
+            fitted = ImageOps.fit(self._bg_src, (w, h), Image.LANCZOS)
+            faded = Image.blend(Image.new("RGB", (w, h), BG), fitted, alpha)
+            self._bg_photo = ctk.CTkImage(light_image=faded, dark_image=faded,
+                                          size=(w, h))
+            self._bg_label.configure(image=self._bg_photo)
+        except Exception:
+            pass
+
+    def _on_content_resize(self, _event=None):
+        if self._bg_job:
+            try:
+                self.after_cancel(self._bg_job)
+            except Exception:
+                pass
+        self._bg_job = self.after(250, self._render_background)
+
     # ---------------------------------------------------------------- о программе
 
     def _build_about(self):
@@ -1014,7 +1405,7 @@ class App(ctk.CTk):
                      text_color=ACTIVE_TEXT, font=ctk.CTkFont(
                          size=13, weight="bold")).pack(padx=16, pady=6)
 
-        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=16, border_width=1,
+        card = ctk.CTkFrame(p, fg_color=CARD, corner_radius=RADIUS, border_width=1,
                             border_color=BORDER)
         card.pack(fill="x", pady=(14, 0))
         ctk.CTkLabel(card, text=("Графическая обёртка над winws из проекта zapret\n"
@@ -1035,12 +1426,17 @@ class App(ctk.CTk):
     # ---------------------------------------------------------------- логика
 
     def _log(self, text: str):
+        line = text.rstrip()
+        self._log_lines.append(line)
+        if len(self._log_lines) > 400:
+            self._log_lines.pop(0)
         self.log_box.configure(state="normal")
-        self.log_box.insert("end", text.rstrip() + "\n")
+        self.log_box.insert("end", line + "\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
     def _clear_log(self):
+        self._log_lines.clear()
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
