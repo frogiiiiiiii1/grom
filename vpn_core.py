@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -459,6 +460,32 @@ def tcp_ping(host, port, timeout=2.5):
     except Exception:
         return None
     return round((time.perf_counter() - t0) * 1000)
+
+
+def proxy_health(proxy_port, timeout=6):
+    """Умная проверка туннеля: HTTP-запрос ЧЕРЕЗ прокси к generate_204.
+
+    True — интернет через VPN реально работает.
+    False — сервер принимает подключения (TCP-пинг живой), но трафик
+    через него не проходит: sing-box отвечает 502 Bad Gateway, когда
+    удалённый сервер мёртв (так бывает с «сдохшими» серверами подписок).
+    """
+    proxy = "http://127.0.0.1:%d" % proxy_port
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    for url in ("http://cp.cloudflare.com/generate_204",
+                "http://www.gstatic.com/generate_204"):
+        try:
+            with opener.open(url, timeout=timeout) as r:
+                if 200 <= r.status < 400:
+                    return True
+        except urllib.error.HTTPError as e:
+            # ответ прокси-сервера получен: 5xx (например 502) = туннель мёртв
+            if 200 <= e.code < 400:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 # ------------------------------------------------------------------ sing-box

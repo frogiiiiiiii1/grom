@@ -40,9 +40,12 @@ from PIL import Image, ImageOps
 import vpn_core
 
 APP_NAME = "grom обходник"
-VERSION = "1.12"
+VERSION = "1.13"
 VPN_CHECK_INTERVAL = 20     # сек между проверками живости VPN-сервера
 VPN_DEAD_FAILS = 3          # столько молчаний подряд = сервер сдох
+VPN_HEALTH_DELAY = 8        # сек до первой проверки туннеля после подключения
+VPN_HEALTH_EVERY = 2        # через сколько циклов проверки делать проверку туннеля
+VPN_PROXY_FAILS = 2         # столько мёртвых проверок туннеля подряд = сервер лежит
 AUTOSTART_TASK = "grom"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                            "grom", "config.json")
@@ -777,6 +780,9 @@ class App(ctk.CTk):
         self._vpn_updated = None      # время последнего обновления
         self._vpn_last_ts = float(vcfg.get("last_update") or 0)
         self._vpn_mon_stop = False    # флаг остановки монитора сервера
+        self._proxy_fails = 0         # мёртвых проверок туннеля подряд
+        self._health_first = True     # первый успешный проход уже логировали?
+        self._health_due = 0.0        # когда ближайшая проверка туннеля
 
         self._build_sidebar()
         self._build_pages()
@@ -1935,6 +1941,9 @@ class App(ctk.CTk):
         self._vpn_proc = proc
         self._vpn_port = port
         self._vpn_mon_stop = False
+        self._proxy_fails = 0
+        self._health_first = True
+        self._health_due = time.time() + VPN_HEALTH_DELAY
         threading.Thread(target=self._vpn_monitor,
                          args=(proc, rec), daemon=True).start()
         self._vpn_apply_connected_ui()
@@ -1942,7 +1951,7 @@ class App(ctk.CTk):
                   f"({rec['host']}:{rec['port']}), прокси 127.0.0.1:{port}.")
 
     def _vpn_monitor(self, proc, rec):
-        """Следит за сервером: сдох или отвалился — просим оповестить."""
+        """Следит за сервером: сдох, отвалился или туннель мёртв."""
         fails = 0
         res = None
         while not self._vpn_mon_stop and self._vpn_proc is proc:
@@ -1957,6 +1966,26 @@ class App(ctk.CTk):
             if fails >= VPN_DEAD_FAILS:   # сервер молчит — отключаем
                 res = "dead"
                 break
+            # умная проверка: порт жив, но проходит ли через него интернет?
+            if (ms is not None and self._vpn_port
+                    and time.time() >= self._health_due):
+                self._health_due = (time.time()
+                                    + VPN_CHECK_INTERVAL * VPN_HEALTH_EVERY)
+                if vpn_core.proxy_health(self._vpn_port):
+                    self._proxy_fails = 0
+                    if self._health_first:
+                        self._health_first = False
+                        try:
+                            self.after(0, self._log,
+                                       "VPN: туннель проверен — интернет через "
+                                       "сервер работает.")
+                        except Exception:
+                            pass
+                else:
+                    self._proxy_fails += 1
+                    if self._proxy_fails >= VPN_PROXY_FAILS:
+                        res = "tunnel"
+                        break
         try:
             self.after(0, self._vpn_monitor_done, res, rec)
         except Exception:
@@ -1967,6 +1996,15 @@ class App(ctk.CTk):
             return
         name = rec["name"][:40]
         self._vpn_disconnect(silent=True)
+        if res == "tunnel":
+            self._log(f"VPN: сервер «{name}» принимает подключения, но трафик "
+                      f"через него не проходит (502) — отключено.")
+            messagebox.showwarning(
+                APP_NAME,
+                f"VPN-сервер «{name}» не работает:\n"
+                f"подключение к нему идёт, но интернет через него не проходит.\n"
+                f"Отключено — выберите другой сервер.")
+            return
         self._log(f"VPN: сервер «{name}» перестал отвечать — отключено.")
         messagebox.showwarning(
             APP_NAME,
