@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-grom обходник — обёртка над winws (zapret) для Windows. v1.12
+grom обходник — обёртка над winws (zapret) для Windows. v1.14
 
 * Тёмный интерфейс, без консольных окон
 * VPN-страница (как в happ): подписка, серверы с флагами стран, обновление
@@ -40,7 +40,7 @@ from PIL import Image, ImageOps
 import vpn_core
 
 APP_NAME = "grom обходник"
-VERSION = "1.13"
+VERSION = "1.14"
 VPN_CHECK_INTERVAL = 20     # сек между проверками живости VPN-сервера
 VPN_DEAD_FAILS = 3          # столько молчаний подряд = сервер сдох
 VPN_HEALTH_DELAY = 8        # сек до первой проверки туннеля после подключения
@@ -576,6 +576,21 @@ ICON_PATH = os.path.join(getattr(sys, "_MEIPASS",
                          "grom_icon.ico")
 
 
+def _copy2_keep_locked(src, dst, *, follow_symlinks=True):
+    """copy2, но залочный файл (WinDivert64.sys, пока драйвер загружен)
+    с уже совпадающим содержимым — не ошибка."""
+    try:
+        shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    except OSError:
+        try:
+            if (os.path.isfile(dst)
+                    and os.path.getsize(dst) == os.path.getsize(src)):
+                return
+        except OSError:
+            pass
+        raise
+
+
 def ensure_embedded_zapret():
     """Распаковать встроенную копию zapret в %LOCALAPPDATA%\\grom\\zapret.
 
@@ -594,9 +609,14 @@ def ensure_embedded_zapret():
         return find_winws(EMBEDDED_DIR) and EMBEDDED_DIR
     shutil.rmtree(EMBEDDED_DIR, ignore_errors=True)
     try:
-        shutil.copytree(BUNDLE_DIR, EMBEDDED_DIR)
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write(VERSION)
+        # dirs_exist_ok: rmtree мог не удалить залоченный файл (например,
+        # WinDivert64.sys, пока драйвер ещё загружен) — тогда copytree без
+        # этого флага падал с FileExistsError и обновление не проходило.
+        shutil.copytree(BUNDLE_DIR, EMBEDDED_DIR, dirs_exist_ok=True,
+                        copy_function=_copy2_keep_locked)
+        if find_winws(EMBEDDED_DIR):
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(VERSION)
     except OSError:
         pass
     return find_winws(EMBEDDED_DIR) and EMBEDDED_DIR
@@ -789,6 +809,7 @@ class App(ctk.CTk):
         self.show_page("home")
 
         self._reload_strategies()
+        self._heal_dead_proxy()
         self._poll_process()
         self._animate_pulse()
         threading.Thread(target=self._hw_loop, daemon=True).start()
@@ -2426,6 +2447,17 @@ class App(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
+    def _heal_dead_proxy(self):
+        """Чинит последствия аварийной смерти grom: прокси, оставшийся
+        включённым на мёртвом локальном порту, — иначе «все сайты лежат»."""
+        try:
+            fixed = vpn_core.heal_dead_proxy()
+        except Exception:
+            fixed = None
+        if fixed:
+            self._log(f"Найден застрявший прокси {fixed} (никто не слушает) — "
+                      f"выключен, интернет восстановлен.")
+
     def _copy_log(self):
         """Кнопка «копировать»: весь лог в буфер обмена."""
         try:
@@ -2620,9 +2652,9 @@ class App(ctk.CTk):
                 self.side_status_dot.configure(text_color=MUTED)
                 self.status_dot.configure(
                     text_color=lerp_color(AMBER_DIM, AMBER, s))
+            self.after(60, self._animate_pulse)
         except tk.TclError:
-            return
-        self.after(60, self._animate_pulse)
+            return   # окно закрыто — тишина (иначе падение без консоли)
 
     def _ask_elevation(self):
         if messagebox.askyesno(
@@ -2641,7 +2673,24 @@ class App(ctk.CTk):
         self.destroy()
 
 
+def _ensure_stderr():
+    """PyInstaller без консоли: sys.stderr/stdout = None -> любая попытка
+    напечатать traceback (например, из Tk-callback) убивает программу молча.
+    Подставляем пустышку."""
+    if sys.stderr is None or sys.stdout is None:
+        try:
+            devnull = open(os.devnull, "w", encoding="utf-8",
+                           errors="replace")
+        except OSError:
+            return
+        if sys.stderr is None:
+            sys.stderr = devnull
+        if sys.stdout is None:
+            sys.stdout = devnull
+
+
 def main():
+    _ensure_stderr()
     if "--setup-embedded" in sys.argv:
         # скрытый тестовый режим: распаковать встроенную копию и выйти
         result = ensure_embedded_zapret()

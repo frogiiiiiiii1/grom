@@ -567,6 +567,35 @@ def set_system_proxy(enabled, server=None):
     _refresh_wininet()
 
 
+def _port_open(host, port, timeout=0.4):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def heal_dead_proxy():
+    """Самоизлечение застрявшего прокси (после аварийной смерти grom).
+
+    Если системный прокси включён на 127.0.0.1:порт, где НИКТО не слушает —
+    все сайты «лежат». Выключаем прокси и возвращаем интернет.
+    Возвращает адрес починенного прокси или None (чинить нечего).
+    """
+    import re as _re
+    st = save_proxy_state()
+    if not st.get("ProxyEnable"):
+        return None
+    server = str(st.get("ProxyServer") or "")
+    m = _re.search(r"127\.0\.0\.1:(\d{2,5})", server)
+    if not m:
+        return None                      # чужой (не наш локальный) прокси
+    if _port_open("127.0.0.1", int(m.group(1))):
+        return None                      # кто-то живой — не трогаем
+    set_system_proxy(False)
+    return server
+
+
 def restore_proxy_state(state):
     """Возвращает сохранённое состояние прокси."""
     import winreg
